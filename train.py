@@ -22,6 +22,11 @@ from tqdm import tqdm
 from utils.image_utils import psnr
 from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
+
+import copy
+from utils.sd_utils import StableDiffusion
+from utils.graphics_utils import getWorld2View2
+
 try:
     from torch.utils.tensorboard import SummaryWriter
     TENSORBOARD_FOUND = True
@@ -67,6 +72,13 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     viewpoint_indices = list(range(len(viewpoint_stack)))
     ema_loss_for_log = 0.0
     ema_Ll1depth_for_log = 0.0
+    
+    # diffusion
+    if opt.lambda_diffusion:
+        guidance_sd = StableDiffusion()
+        guidance_sd.get_text_embeds([""], [""])
+        print(f"[INFO] loaded SD!")
+        diff_cam = copy.deepcopy(scene.getTrainCameras()[0])
 
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
@@ -138,6 +150,19 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             Ll1depth = Ll1depth.item()
         else:
             Ll1depth = 0
+        
+        # diffusion
+        pick_diff_cam = opt.lambda_diffusion and iteration > (opt.iterations*2/3)
+        if pick_diff_cam:
+            diff_pose = scene.getRandEllipsePose(vind, 0, z_variation=0)
+            diff_cam.world_view_transform = torch.tensor(getWorld2View2(diff_pose[:3, :3].T, diff_pose[:3, 3], diff_cam.trans, diff_cam.scale)).transpose(0, 1).cuda()
+            diff_cam.full_proj_transform = (diff_cam.world_view_transform.unsqueeze(0).bmm(diff_cam.projection_matrix.unsqueeze(0))).squeeze(0)
+            diff_cam.camera_center = diff_cam.world_view_transform.inverse()[3, :3]
+            diff_render_pkg = render(diff_cam, gaussians, pipe, background)
+            diff_image = diff_render_pkg["render"]
+   
+            diffusion_loss = guidance_sd.train_step(diff_image.unsqueeze(0), opt.step_ratio)
+            loss += opt.lambda_diffusion * diffusion_loss
 
         loss.backward()
 
