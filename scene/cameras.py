@@ -11,10 +11,31 @@
 
 import torch
 from torch import nn
+import math
 import numpy as np
 from utils.graphics_utils import getWorld2View2, getProjectionMatrix
 from utils.general_utils import PILtoTorch
 import cv2
+
+# diffusion
+def getExtrinsicMatrix(R, t):
+    Rt = np.zeros((4, 4))
+    Rt[:3, :3] = R.transpose()
+    Rt[:3, 3] = t
+    Rt[3, 3] = 1.0
+    return np.float32(Rt)
+
+# diffusion
+def getIntrinsicMatrix(H, W, fovX, fovY):
+    tanHalfFovY = math.tan((fovY / 2))
+    tanHalfFovX = math.tan((fovX / 2))
+    P = torch.zeros(3, 3)
+    P[0, 0] = W / tanHalfFovX / 2.
+    P[1, 1] = H / tanHalfFovY / 2.
+    P[2, 2] = 1.
+    P[0, 2] = W / 2.
+    P[1, 2] = H / 2.
+    return P
 
 class Camera(nn.Module):
     def __init__(self, resolution, colmap_id, R, T, FoVx, FoVy, depth_params, image, invdepthmap,
@@ -88,6 +109,36 @@ class Camera(nn.Module):
         self.full_proj_transform = (self.world_view_transform.unsqueeze(0).bmm(self.projection_matrix.unsqueeze(0))).squeeze(0)
         self.camera_center = self.world_view_transform.inverse()[3, :3]
         
+        # diffusion
+        self.intrinsic_matrix = getIntrinsicMatrix(self.image_height, self.image_width, self.FoVx, self.FoVy).cuda()
+        self.extrinsic_matrix = torch.tensor(getExtrinsicMatrix(R, T)).cuda()
+
+# diffusion
+class PseudoCamera(nn.Module):
+    def __init__(self, R, T, FoVx, FoVy, width, height, trans=np.array([0.0, 0.0, 0.0]), scale=1.0 ):
+        super(PseudoCamera, self).__init__()
+
+        self.R = R
+        self.T = T
+        self.FoVx = FoVx
+        self.FoVy = FoVy
+        self.image_width = width
+        self.image_height = height
+
+        self.zfar = 100.0
+        self.znear = 0.01
+
+        self.trans = trans
+        self.scale = scale
+
+        self.world_view_transform = torch.tensor(getWorld2View2(R, T, trans, scale)).transpose(0, 1).cuda()
+        self.projection_matrix = getProjectionMatrix(znear=self.znear, zfar=self.zfar, fovX=self.FoVx, fovY=self.FoVy).transpose(0,1).cuda()
+        self.full_proj_transform = (self.world_view_transform.unsqueeze(0).bmm(self.projection_matrix.unsqueeze(0))).squeeze(0)
+        self.camera_center = self.world_view_transform.inverse()[3, :3]
+        
+        self.intrinsic_matrix = getIntrinsicMatrix(self.image_height, self.image_width, self.FoVx, self.FoVy).cuda()
+        self.extrinsic_matrix = torch.tensor(getExtrinsicMatrix(R, T)).cuda()
+       
 class MiniCam:
     def __init__(self, width, height, fovy, fovx, znear, zfar, world_view_transform, full_proj_transform):
         self.image_width = width

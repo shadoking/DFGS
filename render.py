@@ -32,6 +32,9 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
     render_path = os.path.join(model_path, name, "ours_{}".format(iteration), "renders")
     gts_path = os.path.join(model_path, name, "ours_{}".format(iteration), "gt")
     depth_path = os.path.join(model_path, name, "ours_{}".format(iteration), "depths")
+    
+    if not args.force and os.path.exists(render_path) and os.path.exists(gts_path) and os.path.exists(depth_path):
+        return
 
     makedirs(render_path, exist_ok=True)
     makedirs(gts_path, exist_ok=True)
@@ -74,7 +77,7 @@ def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParam
 
         # if not skip_test:
         #      render_set(dataset.model_path, "test", scene.loaded_iter, scene.getTestCameras(), gaussians, pipeline, background, dataset.train_test_exp, separate_sh)
-        render_set(dataset.model_path, "renders", scene.loaded_iter, scene.getTrainCameras(), gaussians, pipeline, background, args)
+        render_set(dataset.model_path, "renders", scene.loaded_iter, scene.getTrainCameras(), gaussians, pipeline, background, dataset.train_test_exp, separate_sh)
 
 if __name__ == "__main__":
     # Set up command line argument parser
@@ -86,6 +89,7 @@ if __name__ == "__main__":
     parser.add_argument("--skip_test", action="store_true")
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--depth", action="store_true")
+    parser.add_argument("--force", action="store_false")
     args = get_combined_args(parser)
     print("Rendering " + args.model_path)
 

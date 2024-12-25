@@ -3,7 +3,6 @@ import numpy as np
 def normalize(x):
     return x / np.linalg.norm(x)
 
-
 def viewmatrix(lookdir, up, position, subtract_position=False):
   """Construct lookat view matrix."""
   vec2 = normalize((lookdir - position) if subtract_position else lookdir)
@@ -100,3 +99,68 @@ def generate_ellipse_path(views):
     up = np.eye(3)[ind_up] * np.sign(avg_up[ind_up])
 
     return transform, center, up, low, high, z_low, z_high, ts, t_thetas
+
+
+def generate_random_poses_annealing_view(views, n_frames=10000):
+    """Generates random poses."""
+    init_poses = []
+    for view in views:
+        tmp_view = np.eye(4)
+        tmp_view[:3] = np.concatenate([view.R.T, view.T[:, None]], 1)
+        tmp_view = np.linalg.inv(tmp_view)
+        tmp_view[:, 1:3] *= -1
+        init_poses.append(tmp_view)
+    init_poses = np.stack(init_poses, 0)
+    poses, transform = transform_poses_pca(init_poses)
+
+    # Calculate the focal point for the path (cameras point toward this).
+    center = focus_point_fn(poses)
+    
+    # Set path's up vector to axis closest to average of input pose up vectors.
+    avg_up = poses[:, :3, 1].mean(0)
+    avg_up = avg_up / np.linalg.norm(avg_up)
+    ind_up = np.argmax(np.abs(avg_up))
+    up = np.eye(3)[ind_up] * np.sign(avg_up[ind_up])
+    
+    poses_num = len(poses)
+    t_std_start = 0.2 * n_frames
+    t_std_max = 0.05
+    z_std_start = 0.2 * n_frames
+    z_std_max = 0.05
+    
+    random_poses = []
+    closest_poses = []
+
+    for idx in range(n_frames):
+        
+        pose_idx = np.random.randint(poses_num)
+        selected_pose = poses[pose_idx]
+        
+        selected_position = selected_pose[:3, 3]
+        selected_t = selected_position
+        
+        assert (selected_t < -1).sum() == 0 and (selected_t > 1).sum() == 0
+        
+        t_std = max(t_std_start, float(idx+1)) / n_frames * t_std_max
+        t_noise = np.random.randn(3) * t_std
+        noisy_t = selected_t + t_noise
+        noisy_position = noisy_t
+        noisy_position = np.clip(noisy_position, -1, 1)
+        
+        lookat = center
+        z_std = max(z_std_start, float(idx+1)) / n_frames * z_std_max
+        z_noise = np.random.randn(3) * z_std
+        noisy_lookat = lookat + z_noise
+        
+        noisy_z = noisy_position - noisy_lookat
+        
+        random_pose = np.eye(4)
+        random_pose[:3] = viewmatrix(noisy_z, up, noisy_position)
+        random_pose = np.linalg.inv(transform) @ random_pose
+        random_pose[:3, 1:3] *= -1
+        random_pose = np.linalg.inv(random_pose)
+        random_poses.append(random_pose)
+
+        closest_poses.append(views[pose_idx])
+    
+    return random_poses, closest_poses

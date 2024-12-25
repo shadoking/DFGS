@@ -23,9 +23,6 @@ from utils.image_utils import psnr
 from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
 
-import copy
-from utils.sd_utils import StableDiffusion
-from utils.graphics_utils import getWorld2View2
 
 try:
     from torch.utils.tensorboard import SummaryWriter
@@ -74,11 +71,22 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     ema_Ll1depth_for_log = 0.0
     
     # diffusion
-    if opt.lambda_diffusion:
-        guidance_sd = StableDiffusion()
-        guidance_sd.get_text_embeds([""], [""])
-        print(f"[INFO] loaded SD!")
-        diff_cam = copy.deepcopy(scene.getTrainCameras()[0])
+    # if opt.lambda_diffusion:
+    #     blip_rst_dir = os.path.join(dataset.source_path, 'blip_rst.txt')
+    #     with open(blip_rst_dir, 'r') as f:
+    #         read_blip_rst = f.readline()
+    #         f.close()
+    #     random_select_info = read_blip_rst.split(':')[0]
+    #     blip_rst = read_blip_rst.split(':')[-1]
+    #     print(random_select_info, blip_rst)
+        
+    #     guidance_sd = StableDiffusion(blip_rst=blip_rst)
+    #     guidance_sd.config()
+    #     print("[INFO] loaded SD!")
+        
+    #     pseudo_stack, closest_cam_stack = scene.getPseudoCamerasWithClosestViews()
+    #     pseudo_stack = pseudo_stack.copy()
+    #     closest_cam_stack = closest_cam_stack.copy()
 
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
@@ -143,6 +151,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             invDepth = render_pkg["depth"]
             mono_invdepth = viewpoint_cam.invdepthmap.cuda()
             depth_mask = viewpoint_cam.depth_mask.cuda()
+            print(invDepth.shape)
 
             Ll1depth_pure = torch.abs((invDepth  - mono_invdepth) * depth_mask).mean()
             Ll1depth = depth_l1_weight(iteration) * Ll1depth_pure 
@@ -152,17 +161,14 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             Ll1depth = 0
         
         # diffusion
-        pick_diff_cam = opt.lambda_diffusion and iteration > (opt.iterations*2/3)
-        if pick_diff_cam:
-            diff_pose = scene.getRandEllipsePose(vind, 0, z_variation=0)
-            diff_cam.world_view_transform = torch.tensor(getWorld2View2(diff_pose[:3, :3].T, diff_pose[:3, 3], diff_cam.trans, diff_cam.scale)).transpose(0, 1).cuda()
-            diff_cam.full_proj_transform = (diff_cam.world_view_transform.unsqueeze(0).bmm(diff_cam.projection_matrix.unsqueeze(0))).squeeze(0)
-            diff_cam.camera_center = diff_cam.world_view_transform.inverse()[3, :3]
-            diff_render_pkg = render(diff_cam, gaussians, pipe, background)
-            diff_image = diff_render_pkg["render"]
-   
-            diffusion_loss = guidance_sd.train_step(diff_image.unsqueeze(0), opt.step_ratio)
-            loss += opt.lambda_diffusion * diffusion_loss
+        # pick_diff_cam = iteration > 0 and iteration < 30000
+        # if pick_diff_cam:
+        #     randint_idx = randint(0, len(pseudo_stack) - 1)
+        #     pseudo_cam, closest_cam_1 = pseudo_stack.pop(randint_idx), closest_cam_stack.pop(randint_idx)
+        #     render_pkg_pseudo = render(pseudo_cam, gaussians, pipe, background)
+            
+        #     rendered_img_pseudo = render_pkg_pseudo["render"]
+        #     rendered_depth_pseudo = render_pkg_pseudo["depth"][0]
 
         loss.backward()
 
