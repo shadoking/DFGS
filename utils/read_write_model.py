@@ -28,12 +28,12 @@
 # POSSIBILITY OF SUCH DAMAGE.
 
 
-import os
-import collections
-import numpy as np
-import struct
 import argparse
+import collections
+import os
+import struct
 
+import numpy as np
 
 CameraModel = collections.namedtuple(
     "CameraModel", ["model_id", "model_name", "num_params"]
@@ -261,11 +261,12 @@ def read_images_binary(path_to_model_file):
             qvec = np.array(binary_image_properties[1:5])
             tvec = np.array(binary_image_properties[5:8])
             camera_id = binary_image_properties[8]
-            image_name = ""
+            binary_image_name = b""
             current_char = read_next_bytes(fid, 1, "c")[0]
             while current_char != b"\x00":  # look for the ASCII 0 entry
-                image_name += current_char.decode("utf-8")
+                binary_image_name += current_char
                 current_char = read_next_bytes(fid, 1, "c")[0]
+            image_name = binary_image_name.decode("utf-8")
             num_points2D = read_next_bytes(
                 fid, num_bytes=8, format_char_sequence="Q"
             )[0]
@@ -562,43 +563,43 @@ def rotmat2qvec(R):
     return qvec
 
 
-# def main():
-#     parser = argparse.ArgumentParser(
-#         description="Read and write COLMAP binary and text models"
-#     )
-#     parser.add_argument("--input_model", help="path to input model folder")
-#     parser.add_argument(
-#         "--input_format",
-#         choices=[".bin", ".txt"],
-#         help="input model format",
-#         default="",
-#     )
-#     parser.add_argument("--output_model", help="path to output model folder")
-#     parser.add_argument(
-#         "--output_format",
-#         choices=[".bin", ".txt"],
-#         help="outut model format",
-#         default=".txt",
-#     )
-#     args = parser.parse_args()
+def main():
+    parser = argparse.ArgumentParser(
+        description="Read and write COLMAP binary and text models"
+    )
+    parser.add_argument("--input_model", help="path to input model folder")
+    parser.add_argument(
+        "--input_format",
+        choices=[".bin", ".txt"],
+        help="input model format",
+        default="",
+    )
+    parser.add_argument("--output_model", help="path to output model folder")
+    parser.add_argument(
+        "--output_format",
+        choices=[".bin", ".txt"],
+        help="output model format",
+        default=".txt",
+    )
+    args = parser.parse_args()
 
-#     cameras, images, points3D = read_model(
-#         path=args.input_model, ext=args.input_format
-#     )
+    cameras, images, points3D = read_model(
+        path=args.input_model, ext=args.input_format
+    )
 
-#     print("num_cameras:", len(cameras))
-#     print("num_images:", len(images))
-#     print("num_points3D:", len(points3D))
+    print("num_cameras:", len(cameras))
+    print("num_images:", len(images))
+    print("num_points3D:", len(points3D))
 
-#     if args.output_model is not None:
-#         write_model(
-#             cameras,
-#             images,
-#             points3D,
-#             path=args.output_model,
-#             ext=args.output_format,
-#         )
+    if args.output_model is not None:
+        write_model(
+            cameras,
+            images,
+            points3D,
+            path=args.output_model,
+            ext=args.output_format,
+        )
 
 
-# if __name__ == "__main__":
-#     main()
+if __name__ == "__main__":
+    main()
