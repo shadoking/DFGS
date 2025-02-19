@@ -143,8 +143,41 @@ def save_iamges(sparse_path, c2ws, image_names):
     write_images_binary(images, output_image_bin_path)
     write_images_text(images, output_image_txt_path)
 
-def save_points(sparse_path, points, colors):
+def save_points(sparse_path, ori_points, images, mask, batch_indices='all', use_mask=True):
     output_point_path = os.path.join(sparse_path,  "points3D.ply")
+    
+    # 根据点数选择
+    # points = np.concatenate([p[m] for p, m in zip(ori_points, mask)])
+    # col = np.concatenate([p[m] for p, m in zip(images, mask)])
+    # colors = (col * 255).astype(np.uint8)
+    
+    # if num_points != 'all' and num_points < points.shape[0]:
+    #     indices = np.random.choice(points.shape[0], num_points, replace=False)
+    #     points = points[indices]
+    #     colors = colors[indices]
+    
+    ori_points = np.array(ori_points)
+    images = np.array(images)
+    mask = np.array(mask)
+    
+    if batch_indices == 'all':
+        selected_points = ori_points
+        selected_images = images
+        selected_mask = mask
+    else:
+        selected_points = ori_points[batch_indices]
+        selected_images = images[batch_indices]
+        selected_mask = mask[batch_indices]
+    
+    if use_mask:
+        points = np.concatenate([p[m] for p, m in zip(selected_points, selected_mask)])
+        col = np.concatenate([p[m] for p, m in zip(selected_images, selected_mask)])
+    else:
+        points = selected_points.reshape(-1, 3)
+        col = selected_images.reshape(-1, 3)
+        
+    colors = (col * 255).astype(np.uint8)
+    
     storePly(output_point_path, points, colors)
     
 def run_dust3r(image_paths, model_name=None, device="cuda", batch_size=1, schedule='cosine', lr=0.01, niter=300, silent=True):
@@ -163,14 +196,10 @@ def run_dust3r(image_paths, model_name=None, device="cuda", batch_size=1, schedu
     pts3d = to_numpy(scene.get_pts3d())
     mask = to_numpy(scene.get_masks())
     
-    points = np.concatenate([p[m] for p, m in zip(pts3d, mask)])
-    col = np.concatenate([p[m] for p, m in zip(images, mask)])
-    colors = (col * 255).astype(np.uint8)
-    
     focals = to_numpy(scene.get_focals())
     poses = to_numpy(scene.get_im_poses())
     
-    return images, points, colors, focals, poses, ori_image_shape
+    return images, pts3d, mask, focals, poses, ori_image_shape
 
 if __name__ == '__main__':
     parser = ArgumentParser(description="Run DUSt3R")
@@ -193,7 +222,7 @@ if __name__ == '__main__':
         print(f"Error: The images do not exist!")
         sys.exit(1)
     
-    rsz_images, points, colors, rsz_focals, c2ws, ori_image_shape = run_dust3r(image_paths)
+    rsz_images, ori_points, mask, rsz_focals, c2ws, ori_image_shape = run_dust3r(image_paths)
 
     sparse_path = os.path.join(args.source_path, "sparse", "0")
     makedirs(sparse_path, exist_ok=True)
@@ -205,4 +234,4 @@ if __name__ == '__main__':
     save_iamges(sparse_path, c2ws, image_names)
     
     # points
-    save_points(sparse_path, points, colors)
+    save_points(sparse_path, ori_points, rsz_images, mask)

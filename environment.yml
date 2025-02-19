@@ -22,3 +22,8 @@ dependencies:
     - diffusers
     - transformers
     - accelerate
+    - einops
+    - scipy
+    - roma
+    - trimesh
+    - matplotlib
