@@ -389,56 +389,88 @@ class FrozenCLIPT5Encoder(AbstractEncoder):
         t5_z = self.t5_encoder.encode(text)
         return [clip_z, t5_z]
 
-
 class PointNetEncoder(AbstractEncoder):
-    def __init__(self, T=1, H=32, W=32, input_channels=6, output_dim=128):
+    def __init__(self, num_points=1024, feature_dim=1024, seq_length=256, input_channels=6, freeze_proj=True, device='cuda'):
         super().__init__()
-        # PointNet MLP layers for point-level feature extraction
-        self.mlp1 = nn.Sequential(
+
+        # 设置设备
+        self.device = torch.device(device)  # 默认是 CUDA
+
+        # Point Feature Hierarchical Extraction
+        self.num_points = num_points
+        self.seq_length = seq_length  # Set sequence length to match num_queries in Resampler
+        
+        self.base_mlp = nn.Sequential(
             nn.Conv1d(input_channels, 64, 1),
-            nn.ReLU(),
+            nn.LayerNorm([64, num_points]),
+            nn.GELU(),
             nn.Conv1d(64, 128, 1),
-            nn.ReLU(),
-            nn.Conv1d(128, 1024, 1),
-            nn.ReLU(),
-        )
-        self.mlp2 = nn.Sequential(
-            nn.Linear(1024, 512),
-            nn.ReLU(),
-            nn.Linear(512, 256),
-            nn.ReLU(),
-            nn.Linear(256, output_dim)
-        )
+            nn.LayerNorm([128, num_points]),
+            nn.GELU()
+        ).to(self.device)
         
-        # Additional layers to map to (B, C, T, H, W)
-        self.fc = nn.Linear(output_dim, 256)  # Adjust for channel size C
-        self.conv = nn.Conv3d(256, 64, kernel_size=3, stride=1, padding=1)  # To handle spatial dimensions
+        # Downsampling blocks (128 → 256 → 512)
+        self.downsample_blocks = nn.ModuleList([
+            nn.Sequential(
+                nn.Conv1d(128, 256, kernel_size=3, stride=2, padding=1),  # Fix input channels to 128
+                nn.GroupNorm(4, 256),
+                nn.GELU(),
+            ),
+            nn.Sequential(
+                nn.Conv1d(256, 512, kernel_size=3, stride=2, padding=1),  # Fix input channels to 256
+                nn.GroupNorm(4, 512),
+                nn.GELU(),
+            ),
+        ]).to(self.device)
         
-        # Spatial dimensions (T, H, W)
-        self.T = T
-        self.H = H 
-        self.W = W 
-
-    def forward(self, point_cloud):
-        """
-        point_cloud shape: (B, N, 6)  -> B: batch size, N: number of points, 6: (x, y, z, r, g, b)
-        """
-        # PointNet MLP processing
-        x = point_cloud.transpose(2, 1)  # (B, 6, N) -> (B, N, 6)
-        x = self.mlp1(x)  # (B, 1024, N)
-        x = torch.max(x, 2)[0]  # Max pooling across N points (B, 1024)
-
-        # Feature vector after MLP2 (B, output_dim)
-        x = self.mlp2(x)
-
-        # Map the feature vector to a higher-dimensional space (B, C, T, H, W)
-        x = self.fc(x)  # (B, 256)
+        # CLS Token & Projection
+        self.cls_token = nn.Parameter(torch.randn(1, 1, feature_dim).to(self.device))  # Learnable CLS token
         
-        # Assuming we want to reshape it into a 3D space (B, C, T, H, W)
-        x = x.unsqueeze(2).unsqueeze(3).unsqueeze(4)  # (B, 256, 1, 1, 1)
-        x = x.expand(-1, -1, self.T, self.H, self.W)  # Expand to (B, 256, T, H, W)
+        # Asymmetric projection head: align with CLIP dimensions
+        self.proj = nn.Linear(512, feature_dim).to(self.device)  # Point features → CLIP feature space
+        self.pos_embed = nn.Parameter(torch.randn(1, seq_length, feature_dim).to(self.device))
         
-        # Apply 3D convolution to introduce spatial context
-        x = self.conv(x)  # (B, 64, T, H, W)
+        if freeze_proj:
+            for param in self.proj.parameters():
+                param.requires_grad = False
+    
+    def smart_padding(self, x, target_num):
+        B, C, N = x.shape
+        if N < target_num:
+            replications = (target_num + N - 1) // N
+            x = x.repeat(1, 1, replications)[:, :, :target_num]
+        return x[:, :, :target_num]
+    
+    def forward(self, point_cloud: torch.Tensor) -> torch.Tensor:
+        """ Input: [B, N, 6] → Output aligned to [B, seq_length, feature_dim] """
+        
+        # Ensure point_cloud is on the correct device
+        point_cloud = point_cloud.to(self.device)
 
-        return x
+        # Step 1: Base feature extraction and downsampling
+        x = point_cloud.permute(0, 2, 1)  # → [B, 6, N]
+        x = self.smart_padding(x, self.num_points)  # Ensure enough points
+        
+        x = self.base_mlp(x)  # → [B, 128, 1024]
+        
+        for block in self.downsample_blocks:  # → [B, 256, 512] → [B, 512, 256]
+            x = block(x)
+        
+        # Step 2: Feature compression & CLS token integration
+        x = x.permute(0, 2, 1)  # [B, L=256, D=256]
+        x = self.proj(x)  # → [B, 512, 1024]
+        
+        # Add positional encoding
+        x = x + self.pos_embed
+        
+        # Concatenate CLS Token (expand to batch dimension)
+        cls_tokens = self.cls_token.expand(x.size(0), -1, -1)  # [B, 1, 1024]
+        out = torch.cat([cls_tokens, x], dim=1)  # [B, 257, 1024]
+        
+        # Step 3: Align with Resampler's output (B, num_queries, dim)
+        out = out[:, :self.seq_length, :]  # Ensure seq_length matches Resampler's num_queries
+        
+        return out
+
+
+

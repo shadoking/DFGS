@@ -202,10 +202,12 @@ def image_guided_synthesis(model, prompts, videos, pointcloud, noise_shape, n_sa
     
     pc_encoder = PointNetEncoder()
     pc_emb = pc_encoder(pointcloud[0])
+    print("pc_emb.shape: ", pc_emb.shape)
+    
 
     cond_emb = model.get_learned_conditioning(prompts)
-    cond = {"c_crossattn": [torch.cat([cond_emb, img_emb], dim=1)]}
-    # cond = {"c_crossattn": [torch.cat([cond_emb, img_emb, pc_emb], dim=1)]}
+    # cond = {"c_crossattn": [torch.cat([cond_emb, img_emb], dim=1)]}
+    cond = {"c_crossattn": [torch.cat([cond_emb, img_emb, pc_emb], dim=1)]}
 
     print("cond_emb.shape: ", cond_emb.shape)
     print("cond[c_crossattn]", cond["c_crossattn"][0].shape)
