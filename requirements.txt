@@ -22,4 +22,7 @@ pandas
 decord
 tensorboard
 fairscale
-
+av
+timm
+# h5py
+# lmdb

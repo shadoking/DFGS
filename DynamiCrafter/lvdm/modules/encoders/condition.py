@@ -7,7 +7,6 @@ from torch.utils.checkpoint import checkpoint
 from transformers import T5Tokenizer, T5EncoderModel, CLIPTokenizer, CLIPTextModel
 from lvdm.common import autocast
 from utils.utils import count_params
-from pointnet2 import PointNet2
 
 
 class AbstractEncoder(nn.Module):
@@ -392,20 +391,54 @@ class FrozenCLIPT5Encoder(AbstractEncoder):
 
 
 class PointNetEncoder(AbstractEncoder):
-    def __init__(self, out_shapes=[(64,16,32,32), (128,8,16,16)]):
+    def __init__(self, T=1, H=32, W=32, input_channels=6, output_dim=128):
         super().__init__()
-        self.pn2 = PointNet2(output_dims=[256, 512]) 
-        self.projectors = nn.ModuleList([
-            nn.Sequential(
-                nn.Linear(256, np.prod(shape)), 
-                nn.Unflatten(1, shape)
-            ) for shape in out_shapes
-        ])
-    
-    def forward(self, pc):
-        feats = self.pn2(pc)
-        out = []
-        for feat, proj in zip(feats, self.projectors):
-            cond = proj(feat).unsqueeze(-1).unsqueeze(-1)
-            out.append(cond)
-        return out
+        # PointNet MLP layers for point-level feature extraction
+        self.mlp1 = nn.Sequential(
+            nn.Conv1d(input_channels, 64, 1),
+            nn.ReLU(),
+            nn.Conv1d(64, 128, 1),
+            nn.ReLU(),
+            nn.Conv1d(128, 1024, 1),
+            nn.ReLU(),
+        )
+        self.mlp2 = nn.Sequential(
+            nn.Linear(1024, 512),
+            nn.ReLU(),
+            nn.Linear(512, 256),
+            nn.ReLU(),
+            nn.Linear(256, output_dim)
+        )
+        
+        # Additional layers to map to (B, C, T, H, W)
+        self.fc = nn.Linear(output_dim, 256)  # Adjust for channel size C
+        self.conv = nn.Conv3d(256, 64, kernel_size=3, stride=1, padding=1)  # To handle spatial dimensions
+        
+        # Spatial dimensions (T, H, W)
+        self.T = T
+        self.H = H 
+        self.W = W 
+
+    def forward(self, point_cloud):
+        """
+        point_cloud shape: (B, N, 6)  -> B: batch size, N: number of points, 6: (x, y, z, r, g, b)
+        """
+        # PointNet MLP processing
+        x = point_cloud.transpose(2, 1)  # (B, 6, N) -> (B, N, 6)
+        x = self.mlp1(x)  # (B, 1024, N)
+        x = torch.max(x, 2)[0]  # Max pooling across N points (B, 1024)
+
+        # Feature vector after MLP2 (B, output_dim)
+        x = self.mlp2(x)
+
+        # Map the feature vector to a higher-dimensional space (B, C, T, H, W)
+        x = self.fc(x)  # (B, 256)
+        
+        # Assuming we want to reshape it into a 3D space (B, C, T, H, W)
+        x = x.unsqueeze(2).unsqueeze(3).unsqueeze(4)  # (B, 256, 1, 1, 1)
+        x = x.expand(-1, -1, self.T, self.H, self.W)  # Expand to (B, 256, T, H, W)
+        
+        # Apply 3D convolution to introduce spatial context
+        x = self.conv(x)  # (B, 64, T, H, W)
+
+        return x

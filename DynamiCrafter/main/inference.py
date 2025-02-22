@@ -5,16 +5,20 @@ from tqdm import tqdm
 from einops import rearrange, repeat
 from collections import OrderedDict
 
+
 import torch
 import torchvision
 import torchvision.transforms as transforms
 from pytorch_lightning import seed_everything
 from PIL import Image
-sys.path.insert(1, os.path.join(sys.path[0], '..', '..'))
+sys.path.insert(1, os.path.join(sys.path[0], '..'))
 from lvdm.models.samplers.ddim import DDIMSampler
 from lvdm.models.samplers.ddim_multiplecond import DDIMSampler as DDIMSampler_multicond
 from utils.utils import instantiate_from_config
 import random
+from plyfile import PlyData
+import numpy as np
+from lvdm.modules.encoders.condition import PointNetEncoder
 
 
 def get_filelist(data_dir, postfixes):
@@ -62,6 +66,23 @@ def load_prompts(prompt_file):
         f.close()
     return prompt_list
 
+def load_pointcloud(ply_file, sample_ratio=1/8):
+    plydata = PlyData.read(ply_file)
+    vertices = plydata['vertex']
+    positions = torch.tensor(np.vstack([vertices['x'], vertices['y'], vertices['z']]).T, dtype=torch.float32)                # [N,3]
+    colors = torch.tensor(np.vstack([vertices['red'], vertices['green'], vertices['blue']]).T / 255.0, dtype=torch.float32)  # [N,3]
+    total_points = positions.size(0)
+    sample_size = int(total_points * sample_ratio)
+    indices = torch.randperm(total_points)[:sample_size]
+    sampled_positions = positions[indices]
+    sampled_colors = colors[indices]
+    
+    pointcloud = torch.cat([sampled_positions, sampled_colors], dim=1) # [N, 6]
+
+    return  pointcloud.unsqueeze(0) # [1, N, 6]
+    
+    
+
 def load_data_prompts(data_dir, video_size=(256,256), video_frames=16, interp=False):
     transform = transforms.Compose([
         transforms.Resize(min(video_size)),
@@ -83,6 +104,7 @@ def load_data_prompts(data_dir, video_size=(256,256), video_frames=16, interp=Fa
     # assert len(file_list) == n_samples, "Error: data and prompts are NOT paired!"
     data_list = []
     filename_list = []
+    pointcloud_list = []
     prompt_list = load_prompts(prompt_file[default_idx])
     n_samples = len(prompt_list)
     for idx in range(n_samples):
@@ -103,8 +125,9 @@ def load_data_prompts(data_dir, video_size=(256,256), video_frames=16, interp=Fa
 
         data_list.append(frame_tensor)
         filename_list.append(filename)
-     
-    return filename_list, data_list, prompt_list
+    pointcloud_tensor = load_pointcloud(os.path.join(data_dir, "points3D.ply"))
+    pointcloud_list.append(pointcloud_tensor)
+    return filename_list, data_list, prompt_list, pointcloud_list
 
 
 def save_results(prompt, samples, filename, fakedir, fps=8, loop=False):
@@ -163,7 +186,7 @@ def get_latent_z(model, videos):
     return z
 
 
-def image_guided_synthesis(model, prompts, videos, noise_shape, n_samples=1, ddim_steps=50, ddim_eta=1., \
+def image_guided_synthesis(model, prompts, videos, pointcloud, noise_shape, n_samples=1, ddim_steps=50, ddim_eta=1., \
                         unconditional_guidance_scale=1.0, cfg_img=None, fs=None, text_input=False, multiple_cond_cfg=False, loop=False, interp=False, timestep_spacing='uniform', guidance_rescale=0.0, **kwargs):
     ddim_sampler = DDIMSampler(model) if not multiple_cond_cfg else DDIMSampler_multicond(model)
     batch_size = noise_shape[0]
@@ -175,9 +198,18 @@ def image_guided_synthesis(model, prompts, videos, noise_shape, n_samples=1, ddi
     img = videos[:,:,0] #bchw
     img_emb = model.embedder(img) ## blc
     img_emb = model.image_proj_model(img_emb)
+    print("\nimg_emb.shape: ", img_emb.shape)
+    
+    pc_encoder = PointNetEncoder()
+    pc_emb = pc_encoder(pointcloud[0])
 
     cond_emb = model.get_learned_conditioning(prompts)
-    cond = {"c_crossattn": [torch.cat([cond_emb,img_emb], dim=1)]}
+    cond = {"c_crossattn": [torch.cat([cond_emb, img_emb], dim=1)]}
+    # cond = {"c_crossattn": [torch.cat([cond_emb, img_emb, pc_emb], dim=1)]}
+
+    print("cond_emb.shape: ", cond_emb.shape)
+    print("cond[c_crossattn]", cond["c_crossattn"][0].shape)
+    
     if model.model.conditioning_key == 'hybrid':
         z = get_latent_z(model, videos) # b c t h w
         if loop or interp:
@@ -188,6 +220,8 @@ def image_guided_synthesis(model, prompts, videos, noise_shape, n_samples=1, ddi
             img_cat_cond = z[:,:,:1,:,:]
             img_cat_cond = repeat(img_cat_cond, 'b c t h w -> b c (repeat t) h w', repeat=z.shape[2])
         cond["c_concat"] = [img_cat_cond] # b c 1 h w
+    
+    print("cond[c_concat]", cond["c_concat"][0].shape)
     
     if unconditional_guidance_scale != 1.0:
         if model.uncond_type == "empty_seq":
@@ -282,7 +316,8 @@ def run_inference(args, gpu_num, gpu_no):
 
     ## prompt file setting
     assert os.path.exists(args.prompt_dir), "Error: prompt file Not Found!"
-    filename_list, data_list, prompt_list = load_data_prompts(args.prompt_dir, video_size=(args.height, args.width), video_frames=n_frames, interp=args.interp)
+    filename_list, data_list, prompt_list, pointcloud_list = load_data_prompts(args.prompt_dir, video_size=(args.height, args.width), video_frames=n_frames, interp=args.interp)
+    
     num_samples = len(prompt_list)
     samples_split = num_samples // gpu_num
     print('Prompts testing [rank:%d] %d/%d samples loaded.'%(gpu_no, samples_split, num_samples))
@@ -291,19 +326,21 @@ def run_inference(args, gpu_num, gpu_no):
     prompt_list_rank = [prompt_list[i] for i in indices]
     data_list_rank = [data_list[i] for i in indices]
     filename_list_rank = [filename_list[i] for i in indices]
+    pointcloud_list_rank = [pointcloud_list[i] for i in indices]
 
     start = time.time()
-    with torch.no_grad(), torch.cuda.amp.autocast():
+    with torch.no_grad(), torch.amp.autocast('cuda'):
         for idx, indice in tqdm(enumerate(range(0, len(prompt_list_rank), args.bs)), desc='Sample Batch'):
             prompts = prompt_list_rank[indice:indice+args.bs]
             videos = data_list_rank[indice:indice+args.bs]
             filenames = filename_list_rank[indice:indice+args.bs]
+            pointcloud = pointcloud_list_rank[indice:indice+args.bs]
             if isinstance(videos, list):
                 videos = torch.stack(videos, dim=0).to("cuda")
             else:
                 videos = videos.unsqueeze(0).to("cuda")
 
-            batch_samples = image_guided_synthesis(model, prompts, videos, noise_shape, args.n_samples, args.ddim_steps, args.ddim_eta, \
+            batch_samples = image_guided_synthesis(model, prompts, videos, pointcloud, noise_shape, args.n_samples, args.ddim_steps, args.ddim_eta, \
                                 args.unconditional_guidance_scale, args.cfg_img, args.frame_stride, args.text_input, args.multiple_cond_cfg, args.loop, args.interp, args.timestep_spacing, args.guidance_rescale)
 
             ## save each example individually
