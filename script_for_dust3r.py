@@ -122,7 +122,7 @@ def save_cameras(sparse_path, rsz_focals, org_img_shape, rsz_img_shape):
     write_cameras_binary(cameras, output_camera_bin_path)
     write_cameras_text(cameras, output_camera_txt_path)
 
-def save_iamges(sparse_path, c2ws, image_names):
+def save_images(sparse_path, c2ws, image_names):
     output_image_bin_path = os.path.join(sparse_path,  "images.bin")
     output_image_txt_path = os.path.join(sparse_path,  "images.txt")
     
@@ -231,7 +231,7 @@ if __name__ == '__main__':
     save_cameras(sparse_path, rsz_focals, ori_image_shape, rsz_images.shape)
      
     # iamges
-    save_iamges(sparse_path, c2ws, image_names)
+    save_images(sparse_path, c2ws, image_names)
     
     # points
     save_points(sparse_path, ori_points, rsz_images, mask)

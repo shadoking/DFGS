@@ -1,4 +1,4 @@
-ckpt=checkpoints/dynamicrafter_512_interp_v1/model.ckpt
+ckpt=checkpoints/model.ckpt
 config=configs/inference_512_v1.0.yaml
 
 prompt_dir=../data/prompts
@@ -17,14 +17,15 @@ CUDA_VISIBLE_DEVICES=0 HF_ENDPOINT=https://hf-mirror.com python3 main/inference.
 --savedir $res_dir \
 --n_samples 1 \
 --bs 1 --height 320 --width 512 \
---unconditional_guidance_scale 7.5 \
+--unconditional_guidance_scale 2.5 \
 --ddim_steps 50 \
---ddim_eta 1.0 \
+--ddim_eta 0.5 \
 --prompt_dir $prompt_dir \
 --text_input \
 --video_length 16 \
 --frame_stride ${FS} \
 --timestep_spacing 'uniform_trailing' --guidance_rescale 0.7 --perframe_ae --interp
+# --unconditional_guidance_scale 7.5 \
 # else
 # seed=234
 # name=dynamicrafter_512_$1_seed${seed}

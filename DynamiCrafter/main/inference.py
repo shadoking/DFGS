@@ -196,20 +196,14 @@ def image_guided_synthesis(model, prompts, videos, pointcloud, noise_shape, n_sa
     img = videos[:,:,0] #bchw
     img_emb = model.embedder(img) ## blc
     img_emb = model.image_proj_model(img_emb)
-    print("\nimg_emb.shape: ", img_emb.shape)
     
-    pc_encoder = PointNetEncoder()
-    pc_emb = pc_encoder(pointcloud[0])
-    print("pc_emb.shape: ", pc_emb.shape)
+    # pc_emb = model.pc_embedder(pointcloud[0])
     
 
     cond_emb = model.get_learned_conditioning(prompts)
-    # cond = {"c_crossattn": [torch.cat([cond_emb, img_emb], dim=1)]}
-    cond = {"c_crossattn": [torch.cat([cond_emb, img_emb, pc_emb], dim=1)]}
+    cond = {"c_crossattn": [torch.cat([cond_emb, img_emb], dim=1)]}
+    # cond = {"c_crossattn": [torch.cat([cond_emb, img_emb, pc_emb], dim=1)]}
 
-    print("cond_emb.shape: ", cond_emb.shape)
-    print("cond[c_crossattn]", cond["c_crossattn"][0].shape)
-    
     if model.model.conditioning_key == 'hybrid':
         z = get_latent_z(model, videos) # b c t h w
         if loop or interp:
@@ -220,9 +214,7 @@ def image_guided_synthesis(model, prompts, videos, pointcloud, noise_shape, n_sa
             img_cat_cond = z[:,:,:1,:,:]
             img_cat_cond = repeat(img_cat_cond, 'b c t h w -> b c (repeat t) h w', repeat=z.shape[2])
         cond["c_concat"] = [img_cat_cond] # b c 1 h w
-        # cond["c_concat"] = [torch.cat([img_cat_cond, pc_emb], dim=1)] 
     
-    print("cond[c_concat]", cond["c_concat"][0].shape)
     
     if unconditional_guidance_scale != 1.0:
         if model.uncond_type == "empty_seq":
@@ -295,7 +287,9 @@ def run_inference(args, gpu_num, gpu_no):
     model = model.cuda(gpu_no)
     model.perframe_ae = args.perframe_ae
     assert os.path.exists(args.ckpt_path), "Error: checkpoint Not Found!"
-    model = load_model_checkpoint(model, args.ckpt_path)
+    # model = load_model_checkpoint(model, args.ckpt_path)
+    state_dict = torch.load(args.ckpt_path, map_location="cpu")
+    model.load_state_dict(state_dict, strict=True)
     model.eval()
 
     ## run over data

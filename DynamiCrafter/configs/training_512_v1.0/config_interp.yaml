@@ -1,6 +1,7 @@
 model:
   pretrained_checkpoint: checkpoints/dynamicrafter_512_interp_v1/model.ckpt
-  base_learning_rate: 1.0e-05
+  # base_learning_rate: 1.0e-05
+  base_learning_rate: 5.0e-06
   scale_lr: False
   target: lvdm.models.ddpm3d.LatentVisualDiffusion
   params:
@@ -10,7 +11,7 @@ model:
     linear_end: 0.012
     num_timesteps_cond: 1
     log_every_t: 200
-    timesteps: 800
+    timesteps: 1000
     first_stage_key: video
     cond_stage_key: caption
     cond_stage_trainable: False
@@ -62,6 +63,7 @@ model:
         image_cross_attention: true
         default_fs: 10
         fs_condition: true
+
 
     first_stage_config:
       target: lvdm.models.autoencoder.AutoencoderKL
@@ -115,8 +117,15 @@ model:
       params:
         num_points: 1024
         feature_dim: 1024
-        seq_length: 64
+        seq_length: 16
         input_channels: 6
+        freeze_proj: False
+
+    pose_stage_config:
+      target: lvdm.modules.encoders.condition.PoseEncoder
+      params:
+        input_dim: 7
+        output_dim: 1024
         freeze_proj: False
 
 data:

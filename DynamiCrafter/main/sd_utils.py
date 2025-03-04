@@ -16,7 +16,9 @@ from plyfile import PlyData
 from einops import rearrange, repeat
 import torchvision.transforms as transforms
 from PIL import Image
-
+from tqdm import tqdm
+import time
+from read_write_model import read_images_binary
 
 def get_nondefault_trainer_args(args):
     parser = argparse.ArgumentParser()
@@ -31,11 +33,13 @@ def get_latent_z(model, videos):
     return z
 
 class DiffusionModule(nn.Module):
-    def __init__(self, parser, config_dir, save_dir, prompt_dir, device="cuda"):
+    def __init__(self, parser, config_dir, save_dir, prompt_dir, epochs=500, save_every_n_epoch=100, device="cuda"):
         super().__init__()
         self.save_dir = save_dir
         self.prompt_dir = prompt_dir
         self.device = device
+        self.epochs = epochs
+        self.save_every_n_epoch = save_every_n_epoch
         
         now = datetime.datetime.now().strftime("%Y-%m-%dT%H-%M-%S")
         
@@ -53,7 +57,19 @@ class DiffusionModule(nn.Module):
         trainer_config = lightning_config.get("trainer", OmegaConf.create()) 
         workdir, ckptdir, cfgdir, loginfo = init_workspace(args.name, args.logdir, config, lightning_config, 0)
         logger = set_logger(logfile=os.path.join(loginfo, 'log_%s.txt'%(now)))
+        
+        ## 解析配置
+        args, unknown = parser.parse_known_args()
+        seed = args.seed if hasattr(args, "seed") else 42
+        torch.manual_seed(seed)
 
+        configs = [OmegaConf.load(cfg) for cfg in config_dir]
+        cli = OmegaConf.from_dotlist(unknown)
+        config = OmegaConf.merge(*configs, cli)
+
+        lightning_config = config.pop("lightning", OmegaConf.create())
+        trainer_config = lightning_config.get("trainer", OmegaConf.create()) 
+        
         logger.info("***** Configing Model *****")
         config.model.params.logdir = workdir
         model = instantiate_from_config(config.model)
@@ -71,28 +87,26 @@ class DiffusionModule(nn.Module):
         model.learning_rate = base_lr
         
         self.model = model.to(device)
-        
+             
     def training_step(self):
         loss, loss_dict = self.shared_step()
-        
-        self.model.log_dict(loss_dict, prog_bar=True, logger=True, on_step=True, on_epoch=True, sync_dist=False)
-        
-        print(f"epoch:{self.current_epoch} [globalstep:{self.global_step}]: loss={loss}")
+        #self.model.log_dict(loss_dict, prog_bar=True, logger=True, on_step=True, on_epoch=True, sync_dist=False)
         return loss
     
     def shared_step(self, **kwargs):
-        x, c, fs = self.get_batch_input(return_fs=True)
-        kwargs.update({"fs": fs.long()})
-        loss, loss_dict = self.model(x, c, **kwargs)
+        x, c, poses, fs = self.get_batch_input(return_fs=True)
+        # kwargs.update({"fs": fs.long()})
+        loss, loss_dict = self.model(x, c, poses, **kwargs)
         return loss, loss_dict
         
         
-    def get_batch_input(self, return_fs=False, fs=3):
-        filename_list, data_list, prompt_list, pointcloud_list = self.get_data()
+    def get_batch_input(self, return_fs=False, return_pose=True, fs=3):
+        filename_list, data_list, prompt_list, pointcloud_list, pose_list = self.get_data()
         prompts = prompt_list[0] 
         videos = data_list[0]
-        filenames = filename_list[0]
+        # filenames = filename_list[0]
         pointcloud = pointcloud_list[0]
+        pose = pose_list[0] #(1, 2, 7)
         
         if isinstance(videos, list):
             videos = torch.stack(videos, dim=0).to("cuda")
@@ -105,11 +119,16 @@ class DiffusionModule(nn.Module):
         img_emb = self.model.embedder(img)  ## blc
         img_emb = self.model.image_proj_model(img_emb)
         
-        #pc_emb = self.model.pc_embedder(pointcloud)
+        pc_emb = self.model.pc_embedder(pointcloud)
+        
+        ## TODO 根据首尾帧POSE以及帧数预测出全部
+        # (16, 7)
+        
+        
         
         cond_emb = self.model.get_learned_conditioning(prompts)
-        #cond = {"c_crossattn": [torch.cat([cond_emb, img_emb, pc_emb], dim=1)]}
-        cond = {"c_crossattn": [torch.cat([cond_emb, img_emb], dim=1)]}
+        cond = {"c_crossattn": [torch.cat([cond_emb, img_emb, pc_emb], dim=1)]}
+        # cond = {"c_crossattn": [torch.cat([cond_emb, img_emb], dim=1)]}
         if self.model.model.conditioning_key == 'hybrid':
             z = get_latent_z(self.model, videos) # b c t h w
             img_cat_cond = torch.zeros_like(z)
@@ -118,9 +137,11 @@ class DiffusionModule(nn.Module):
             
             cond["c_concat"] = [img_cat_cond] # b c 1 h w [1, 4, 16, 64, 64]
 
-
         out = [z, cond]
         
+        if return_pose:
+            out.append(pose)
+            
         if return_fs:
             out.append(fs)
         
@@ -130,9 +151,9 @@ class DiffusionModule(nn.Module):
         os.makedirs(self.save_dir, exist_ok=True)
         
         assert os.path.exists(self.prompt_dir)
-        filename_list, data_list, prompt_list, pointcloud_list = self.load_data_prompts(self.prompt_dir, video_size=(height, width), video_frames=n_frames, interp=True)
+        filename_list, data_list, prompt_list, pointcloud_list, pose_list = self.load_data_prompts(self.prompt_dir, video_size=(height, width), video_frames=n_frames, interp=True)
 
-        return filename_list, data_list, prompt_list, pointcloud_list
+        return filename_list, data_list, prompt_list, pointcloud_list, pose_list
 
     def load_data_prompts(self, data_dir, video_size=(256,256), video_frames=16, interp=False):
         transform = transforms.Compose([
@@ -156,6 +177,7 @@ class DiffusionModule(nn.Module):
         data_list = []
         filename_list = []
         pointcloud_list = []
+        pose_list = []
         prompt_list = self.load_prompts(prompt_file[default_idx])
         n_samples = len(prompt_list)
         for idx in range(n_samples):
@@ -177,8 +199,10 @@ class DiffusionModule(nn.Module):
             data_list.append(frame_tensor)
             filename_list.append(filename)
         pointcloud_tensor = self.load_pointcloud(os.path.join(data_dir, "points3D.ply"))
+        pose_tensor = self.load_pose(os.path.join(data_dir, "images.bin"))
         pointcloud_list.append(pointcloud_tensor)
-        return filename_list, data_list, prompt_list, pointcloud_list
+        pose_list.append(pose_tensor)
+        return filename_list, data_list, prompt_list, pointcloud_list, pose_list
 
     def load_pointcloud(self, ply_file, sample_ratio=1/8):
         plydata = PlyData.read(ply_file)
@@ -194,6 +218,21 @@ class DiffusionModule(nn.Module):
         pointcloud = torch.cat([sampled_positions, sampled_colors], dim=1) # [N, 6]
 
         return  pointcloud.unsqueeze(0) # [1, N, 6]
+    
+    def load_pose(self, pose_file):
+        images = read_images_binary(pose_file)
+        poses = []
+    
+        for _, data in images.items():
+            qvec = data.qvec
+            tvec = data.tvec
+            
+            pose = np.concatenate([qvec, tvec])
+            poses.append(pose)
+                
+        poses_np = np.array(poses, dtype=np.float32)  # 转为 NumPy 数组
+        poses_tensor = torch.from_numpy(poses_np)  
+        return poses_tensor.unsqueeze(0).to(self.device) # [2, 7]
     
     def load_prompts(self, prompt_file):
         f = open(prompt_file, 'r')
@@ -212,54 +251,58 @@ class DiffusionModule(nn.Module):
             file_list.extend(glob.glob(pattern))
         file_list.sort()
         return file_list
+    
+    def configure_optimizers(self):
+        lr = self.model.learning_rate
+        params = list(self.model.model.parameters())
+        if self.model.image_proj_model_trainable:
+            params.extend(list(self.model.image_proj_model.parameters()))
         
-    def train_step(
-        self,
-        pred_rgb,
-        step_ratio=None,
-        guidance_scale=100,
-        as_latent=False
-    ):
-        batch_size = pred_rgb.shape[0]
-        pred_rgb = pred_rgb.to(self.weights_dtype)
-        
-        if as_latent:
-            latents = F.interpolate(pred_rgb, (64, 64), mode="bilinear", align_corners=False) * 2 - 1
-        else:
-            pred_rgb_512 = F.interpolate(pred_rgb, (512, 512), mode="bilinear", align_corners=False)
-            latents = self.encode_imgs(pred_rgb_512)
+        optimizer = torch.optim.AdamW(params, lr=lr) 
+        return optimizer        
             
-        if step_ratio is not None:
-            t = np.round((1 - step_ratio) * self.num_train_timesteps).clip(self.min_step, self.max_step)
-            t = torch.full((batch_size,), t, dtype=torch.long, device=self.device)
-        else:
-            t = torch.randint(self.min_step, self.max_step + 1, (batch_size, ), dtype=torch.long, device=self.device)
+    def train(self):
+        os.makedirs(self.save_dir, exist_ok=True)
         
-        w = (1 - self.alphas[t]).view(batch_size, 1, 1, 1)
-        
-        with torch.no_grad():
-            noise = torch.randn_like(latents)
-            latents_noisy = self.scheduler.add_noise(latents, noise, t)
+        optimizer = self.configure_optimizers()
+        scaler = torch.amp.GradScaler('cuda')
+        # start_time = time.time() 
+        best_loss = float("inf") 
+        pbar = tqdm(range(1, self.epochs+1), desc="Training Progress", unit="epoch")
+        for epoch in pbar:
+            self.model.train()
+            optimizer.zero_grad()
             
-            latent_model_input = torch.cat([latents_noisy] * 2)
-            tt = torch.cat([t] * 2)
+            with torch.amp.autocast('cuda'):
+                loss = self.training_step()
+                
+            scaler.scale(loss).backward()
+    
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad()
             
-            noise_pred = self.unet(
-                latent_model_input, tt, encoder_hidden_states=self.embeddings.repeat(batch_size, 1, 1)
-            ).sample
-            
-            noise_pred_uncond, noise_pred_pos = noise_pred.chunk(2)
-            noise_pred = noise_pred_uncond + guidance_scale * (
-                noise_pred_pos - noise_pred_uncond
-            )
-        
-        grad = w * (noise_pred - noise)
-        grad = torch.nan_to_num(grad)
-        
-        target = (latents - grad).detach()
-        loss = 0.5 * F.mse_loss(latents.float(), target, reduction='sum') / latents.shape[0]
+             # **计算剩余时间**
+            # elapsed_time = time.time() - start_time
+            # avg_time_per_epoch = elapsed_time / (epoch + 1)
+            # remaining_time = avg_time_per_epoch * (self.epochs - epoch - 1)
 
-        return loss
+            if loss.item() < best_loss:
+                best_loss = loss.item()
+                torch.save(self.model.state_dict(), os.path.join(save_dir, "best_model.ckpt"))
+            
+            if epoch % self.save_every_n_epoch == 0:
+                torch.save(self.model.state_dict(), os.path.join(self.save_dir, f"model_{epoch}.ckpt"))
+
+            # print(f"Epoch {epoch+1}/{self.epochs} | Loss: {loss.item():.4f} | Remaining Time: {remaining_time:.2f}s")
+            pbar.set_postfix({
+                "loss": f"{loss.item():.4f}",
+                "best_loss": f"{best_loss:.4f}"
+            })
+            
+        #torch.save(self.model.state_dict(), os.path.join(save_dir, "last.ckpt"))
+        print("Done!")
+    
     
     
 if __name__ == '__main__':
@@ -284,9 +327,6 @@ if __name__ == '__main__':
     save_dir = "checkpoints"
     data_dir = "../data/prompts"
     
-    print(config_file)
 
-
-    diffusionModule = DiffusionModule(parser, [config_file], save_dir, data_dir)
-    with torch.amp.autocast('cuda'):
-        diffusionModule.training_step()
+    diffusionModule = DiffusionModule(parser, [config_file], save_dir, data_dir, epochs=20, save_every_n_epoch=20)
+    diffusionModule.train()
