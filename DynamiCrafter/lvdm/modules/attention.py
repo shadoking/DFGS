@@ -114,6 +114,7 @@ class CrossAttention(nn.Module):
             sim.masked_fill_(~(mask>0.5), max_neg_value)
 
         # attention, what we cannot get enough of
+        print(sim.shape)
         sim = sim.softmax(dim=-1)
 
         out = torch.einsum('b i j, b j d -> b i d', sim, v)

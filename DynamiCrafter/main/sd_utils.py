@@ -1,5 +1,5 @@
 import argparse, os, sys, datetime, glob
-sys.path.append("DynamiCrafter")
+sys.path.insert(1, os.path.join(sys.path[0], '..'))
 from omegaconf import OmegaConf
 import torch
 import torch.nn as nn
@@ -11,20 +11,31 @@ from pytorch_lightning import seed_everything
 from utils.utils import instantiate_from_config
 from main.utils_train import get_trainer_callbacks, get_trainer_logger, get_trainer_strategy
 from main.utils_train import set_logger, init_workspace, load_checkpoints
-from lvdm.models.ddpm3d import LatentVisualDiffusion
+from lvdm.modules.encoders.condition import PointNetEncoder
 from plyfile import PlyData
 from einops import rearrange, repeat
 import torchvision.transforms as transforms
 from PIL import Image
 
+
 def get_nondefault_trainer_args(args):
     parser = argparse.ArgumentParser()
     default_trainer_args = parser.parse_args([])
     return sorted(k for k in vars(default_trainer_args) if getattr(args, k) != getattr(default_trainer_args, k))
+
+def get_latent_z(model, videos):
+    b, c, t, h, w = videos.shape
+    x = rearrange(videos, 'b c t h w -> (b t) c h w')
+    z = model.encode_first_stage(x)
+    z = rearrange(z, '(b t) c h w -> b c t h w', b=b, t=t)
+    return z
+
 class DiffusionModule(nn.Module):
-    def __init__(self, parser, config_dir, save_dir, prompt_dir):
+    def __init__(self, parser, config_dir, save_dir, prompt_dir, device="cuda"):
+        super().__init__()
         self.save_dir = save_dir
         self.prompt_dir = prompt_dir
+        self.device = device
         
         now = datetime.datetime.now().strftime("%Y-%m-%dT%H-%M-%S")
         
@@ -59,34 +70,67 @@ class DiffusionModule(nn.Module):
         base_lr = config.model.base_learning_rate
         model.learning_rate = base_lr
         
-    def training_step(self, batch=1):
-        loss, loss_dict = self.shared_step(batch, random_uncond=True)
+        self.model = model.to(device)
         
+    def training_step(self):
+        loss, loss_dict = self.shared_step()
+        
+        self.model.log_dict(loss_dict, prog_bar=True, logger=True, on_step=True, on_epoch=True, sync_dist=False)
+        
+        print(f"epoch:{self.current_epoch} [globalstep:{self.global_step}]: loss={loss}")
+        return loss
     
-    def shared_step(self, batch, random_uncond, **kwargs):
-        # x, c, fs = self.get_batch_input(batch, random_uncond=random_uncond, return_fs=True)
-        # kwargs.update({"fs": fs.long()})
-        # loss, loss_dict = self(x, c, **kwargs)
-        # return loss, loss_dict 
-        self.get(batch, self.save_dir, self.prompt_dir)
-    
-    def get_batch(self, save_dir, prompt_dir):
-        filename_list, data_list, prompt_list, pointcloud_list = self.get_data(save_dir, prompt_dir)
-        print(len(filename_list))
-        print(len(data_list))
-        print(len(prompt_list))
-        print(len(pointcloud_list))
+    def shared_step(self, **kwargs):
+        x, c, fs = self.get_batch_input(return_fs=True)
+        kwargs.update({"fs": fs.long()})
+        loss, loss_dict = self.model(x, c, **kwargs)
+        return loss, loss_dict
+        
+        
+    def get_batch_input(self, return_fs=False, fs=3):
+        filename_list, data_list, prompt_list, pointcloud_list = self.get_data()
         prompts = prompt_list[0] 
         videos = data_list[0]
         filenames = filename_list[0]
         pointcloud = pointcloud_list[0]
         
+        if isinstance(videos, list):
+            videos = torch.stack(videos, dim=0).to("cuda")
+        else:
+            videos = videos.unsqueeze(0).to("cuda")
+            
+        fs = torch.tensor([fs], dtype=torch.long, device=self.device)
         
-    def get_data(self, save_dir, prompt_dir, height=512, width=512, n_frames=16):
-        os.makedirs(save_dir, exist_ok=True)
+        img = videos[:,:,0]  #bchw
+        img_emb = self.model.embedder(img)  ## blc
+        img_emb = self.model.image_proj_model(img_emb)
         
-        assert os.path.exists(prompt_dir)
-        filename_list, data_list, prompt_list, pointcloud_list = self.load_data_prompts(prompt_dir, video_size=(height, width), video_frames=n_frames, interp=True)
+        #pc_emb = self.model.pc_embedder(pointcloud)
+        
+        cond_emb = self.model.get_learned_conditioning(prompts)
+        #cond = {"c_crossattn": [torch.cat([cond_emb, img_emb, pc_emb], dim=1)]}
+        cond = {"c_crossattn": [torch.cat([cond_emb, img_emb], dim=1)]}
+        if self.model.model.conditioning_key == 'hybrid':
+            z = get_latent_z(self.model, videos) # b c t h w
+            img_cat_cond = torch.zeros_like(z)
+            img_cat_cond[:,:,0,:,:] = z[:,:,0,:,:]
+            img_cat_cond[:,:,-1,:,:] = z[:,:,-1,:,:]
+            
+            cond["c_concat"] = [img_cat_cond] # b c 1 h w [1, 4, 16, 64, 64]
+
+
+        out = [z, cond]
+        
+        if return_fs:
+            out.append(fs)
+        
+        return out
+        
+    def get_data(self, height=512, width=512, n_frames=16):
+        os.makedirs(self.save_dir, exist_ok=True)
+        
+        assert os.path.exists(self.prompt_dir)
+        filename_list, data_list, prompt_list, pointcloud_list = self.load_data_prompts(self.prompt_dir, video_size=(height, width), video_frames=n_frames, interp=True)
 
         return filename_list, data_list, prompt_list, pointcloud_list
 
@@ -136,7 +180,7 @@ class DiffusionModule(nn.Module):
         pointcloud_list.append(pointcloud_tensor)
         return filename_list, data_list, prompt_list, pointcloud_list
 
-    def load_pointcloud(ply_file, sample_ratio=1/8):
+    def load_pointcloud(self, ply_file, sample_ratio=1/8):
         plydata = PlyData.read(ply_file)
         vertices = plydata['vertex']
         positions = torch.tensor(np.vstack([vertices['x'], vertices['y'], vertices['z']]).T, dtype=torch.float32)                # [N,3]
@@ -151,7 +195,7 @@ class DiffusionModule(nn.Module):
 
         return  pointcloud.unsqueeze(0) # [1, N, 6]
     
-    def load_prompts(prompt_file):
+    def load_prompts(self, prompt_file):
         f = open(prompt_file, 'r')
         prompt_list = []
         for idx, line in enumerate(f.readlines()):
@@ -161,7 +205,7 @@ class DiffusionModule(nn.Module):
             f.close()
         return prompt_list
     
-    def get_filelist(data_dir, postfixes):
+    def get_filelist(self, data_dir, postfixes):
         patterns = [os.path.join(data_dir, f"*.{postfix}") for postfix in postfixes]
         file_list = []
         for pattern in patterns:
@@ -236,9 +280,13 @@ if __name__ == '__main__':
     parser.add_argument("--debug", "-d", action='store_true', default=False, help="enable post-mortem debugging")
     
     name="training_512_v1.0"
-    config_file="DynamiCrafter/configs/" + name + "/config_interp.yaml"
+    config_file="configs/" + name + "/config_interp.yaml"
     save_dir = "checkpoints"
-    data_dir = "data/prompts"
+    data_dir = "../data/prompts"
+    
+    print(config_file)
 
 
-    diffusionModule = DiffusionModule(parser, config_file, save_dir, data_dir)
+    diffusionModule = DiffusionModule(parser, [config_file], save_dir, data_dir)
+    with torch.amp.autocast('cuda'):
+        diffusionModule.training_step()

@@ -1028,11 +1028,12 @@ class LatentDiffusion(DDPM):
         return lr_scheduler
 
 class LatentVisualDiffusion(LatentDiffusion):
-    def __init__(self, img_cond_stage_config, image_proj_stage_config, freeze_embedder=True, image_proj_model_trainable=True, *args, **kwargs):
+    def __init__(self, img_cond_stage_config, image_proj_stage_config, point_stage_config, freeze_embedder=True, image_proj_model_trainable=True, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.image_proj_model_trainable = image_proj_model_trainable
         self._init_embedder(img_cond_stage_config, freeze_embedder)
         self._init_img_ctx_projector(image_proj_stage_config, image_proj_model_trainable)
+        self._init_point_embedder(point_stage_config)
 
     def _init_img_ctx_projector(self, config, trainable):
         self.image_proj_model = instantiate_from_config(config)
@@ -1048,6 +1049,14 @@ class LatentVisualDiffusion(LatentDiffusion):
             self.embedder.eval()
             self.embedder.train = disabled_train
             for param in self.embedder.parameters():
+                param.requires_grad = False
+    
+    def _init_point_embedder(self, config, freeze=False):
+        self.pc_embedder = instantiate_from_config(config)
+        if freeze:
+            self.pc_embedder.eval()
+            self.pc_embedder.train = disabled_train
+            for param in self.pc_embedder.parameters():
                 param.requires_grad = False
 
     def shared_step(self, batch, random_uncond, **kwargs):

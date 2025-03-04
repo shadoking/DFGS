@@ -81,7 +81,6 @@ def load_pointcloud(ply_file, sample_ratio=1/8):
 
     return  pointcloud.unsqueeze(0) # [1, N, 6]
     
-    
 
 def load_data_prompts(data_dir, video_size=(256,256), video_frames=16, interp=False):
     transform = transforms.Compose([
@@ -185,7 +184,6 @@ def get_latent_z(model, videos):
     z = rearrange(z, '(b t) c h w -> b c t h w', b=b, t=t)
     return z
 
-
 def image_guided_synthesis(model, prompts, videos, pointcloud, noise_shape, n_samples=1, ddim_steps=50, ddim_eta=1., \
                         unconditional_guidance_scale=1.0, cfg_img=None, fs=None, text_input=False, multiple_cond_cfg=False, loop=False, interp=False, timestep_spacing='uniform', guidance_rescale=0.0, **kwargs):
     ddim_sampler = DDIMSampler(model) if not multiple_cond_cfg else DDIMSampler_multicond(model)
@@ -222,6 +220,7 @@ def image_guided_synthesis(model, prompts, videos, pointcloud, noise_shape, n_sa
             img_cat_cond = z[:,:,:1,:,:]
             img_cat_cond = repeat(img_cat_cond, 'b c t h w -> b c (repeat t) h w', repeat=z.shape[2])
         cond["c_concat"] = [img_cat_cond] # b c 1 h w
+        # cond["c_concat"] = [torch.cat([img_cat_cond, pc_emb], dim=1)] 
     
     print("cond[c_concat]", cond["c_concat"][0].shape)
     
@@ -253,14 +252,13 @@ def image_guided_synthesis(model, prompts, videos, pointcloud, noise_shape, n_sa
 
     batch_variants = []
     for _ in range(n_samples):
-
         if z0 is not None:
             cond_z0 = z0.clone()
             kwargs.update({"clean_cond": True})
         else:
             cond_z0 = None
+            
         if ddim_sampler is not None:
-
             samples, _ = ddim_sampler.sample(S=ddim_steps,
                                             conditioning=cond,
                                             batch_size=batch_size,

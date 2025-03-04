@@ -55,7 +55,6 @@ if __name__ == "__main__":
     configs = [OmegaConf.load(cfg) for cfg in args.base]
     cli = OmegaConf.from_dotlist(unknown)
     config = OmegaConf.merge(*configs, cli)
-    print(config)
     
     lightning_config = config.pop("lightning", OmegaConf.create())
     trainer_config = lightning_config.get("trainer", OmegaConf.create()) 
@@ -144,7 +143,7 @@ if __name__ == "__main__":
     signal.signal(signal.SIGUSR1, melk)
     signal.signal(signal.SIGUSR2, divein)
 
-    ## Running LOOP >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+    # Running LOOP >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
     # logger.info("***** Running the Loop *****")
     # if args.train:
     #     try:
