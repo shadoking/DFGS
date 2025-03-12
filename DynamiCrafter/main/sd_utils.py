@@ -121,9 +121,9 @@ class DiffusionModule(nn.Module):
         
         pc_emb = self.model.pc_embedder(pointcloud)
         
-        ## TODO 根据首尾帧POSE以及帧数预测出全部
-        # (16, 7)
-        
+
+        pose_all = self.get_new_pose(pose)
+        print(pose_all.shape)
         
         
         cond_emb = self.model.get_learned_conditioning(prompts)
@@ -243,6 +243,99 @@ class DiffusionModule(nn.Module):
                 prompt_list.append(l)
             f.close()
         return prompt_list
+    
+    def get_new_pose(self, original_pose, num_views=14):
+        """
+        根据两个初始相机的位姿生成一个椭圆轨道，并在轨道上生成新的视角和位姿。
+
+        参数:
+            original_pose (torch.Tensor 或 np.ndarray): 包含两个相机位姿的张量 (1, 2, 7)。
+            num_views (int): 需要生成的新视角数量，默认为14。
+
+        返回:
+            torch.Tensor: 包含每个新视角的位姿 (R_new, t_new) 的张量，形状为 (16, 7)。
+        """
+        # 确保 original_pose 是 NumPy 数组
+        if isinstance(original_pose, np.ndarray):
+            pose_array = original_pose
+        else:
+            pose_array = original_pose.detach().cpu().numpy()  # 确保是 NumPy 数据
+
+        print("original_pose shape:", pose_array.shape)  # (1, 2, 7)
+
+        # 提取第一相机的四元数和平移向量
+        q1 = pose_array[0, 0, :4]  # (4,) 四元数
+        t1 = pose_array[0, 0, 4:7].reshape(3, 1)  # (3,1) 平移向量
+
+        # 提取第二相机的四元数和平移向量
+        q2 = pose_array[0, 1, :4]  # (4,)
+        t2 = pose_array[0, 1, 4:7].reshape(3, 1)  # (3,1)
+
+        # 将四元数转换为旋转矩阵 (确保四元数格式为 [x, y, z, w])
+        R1 = R.from_quat(q1).as_matrix()  # (3,3)
+        R2 = R.from_quat(q2).as_matrix()  # (3,3)
+
+        # 计算相机中心
+        C1 = -R1.T @ t1  # (3,1)
+        C2 = -R2.T @ t2  # (3,1)
+
+        # 椭圆参数
+        center = (C1 + C2) / 2  # 椭圆中心 (3,1)
+        a = np.linalg.norm(C1 - C2) / 2  # 长轴
+        b = a / 2  # 短轴
+
+        # 生成椭圆轨道上的点
+        angles = np.linspace(0, 2 * np.pi, num_views)  # 均匀采样角度
+        ellipse_points = np.array([a * np.cos(angles), b * np.sin(angles), np.zeros(num_views)]).T  # (14,3)
+
+        # 处理广播问题 (转换 center 为 (1,3) 以进行广播)
+        center = center.reshape(1, 3)  # 确保形状匹配
+        ellipse_points += center  # (14,3) + (1,3) 可广播
+
+        # 计算每个点的位姿
+        poses = []
+        for point in ellipse_points:
+            # 相机位置
+            C_new = point.reshape(3, 1)  # 转换为 (3,1)
+
+            # 相机朝向场景中心
+            look_at = center.T  # 变成 (3,1)
+            forward = look_at - C_new
+            forward = forward / np.linalg.norm(forward)
+
+            # 计算旋转矩阵
+            up = np.array([0, 1, 0])  # 假设上方向为 Y 轴
+            right = np.cross(up, forward.squeeze())  # 计算右方向
+            right = right / np.linalg.norm(right)
+            up = np.cross(forward.squeeze(), right)  # 重新计算 up
+
+            R_new = np.vstack((right, up, -forward.squeeze())).T  # 计算新的旋转矩阵
+            # 强制保证旋转矩阵是右手坐标系
+            if np.linalg.det(R_new) < 0:
+                R_new = -R_new
+
+            # 计算新的平移向量
+            t_new = -R_new @ C_new
+
+            # 将旋转矩阵转换为四元数
+            q_new = R.from_matrix(R_new).as_quat()  # (4,)
+
+            # 将四元数和平移向量合并为一个 7 维向量
+            pose_new = np.concatenate([q_new, t_new.squeeze()])  # (7,)
+
+            poses.append(pose_new)
+
+        # 将第一个和最后一个视角添加为原始位姿
+        q1_t = np.concatenate([q1, t1.squeeze()])  # (7,)
+        q2_t = np.concatenate([q2, t2.squeeze()])  # (7,)
+
+        poses.insert(0, q1_t)  # 在最前面添加原始第一个相机位姿
+        poses.append(q2_t)  # 在最后添加原始第二个相机位姿
+
+        # 转换为 torch.Tensor 并返回
+        poses_tensor = torch.tensor(poses, dtype=torch.float32)
+
+        return poses_tensor.unsqueeze(0)
     
     def get_filelist(self, data_dir, postfixes):
         patterns = [os.path.join(data_dir, f"*.{postfix}") for postfix in postfixes]
