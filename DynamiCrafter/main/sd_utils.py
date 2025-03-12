@@ -94,19 +94,19 @@ class DiffusionModule(nn.Module):
         return loss
     
     def shared_step(self, **kwargs):
-        x, c, poses, fs = self.get_batch_input(return_fs=True)
+        x, c, poses, poses_all, fs = self.get_batch_input(return_fs=True)
         # kwargs.update({"fs": fs.long()})
-        loss, loss_dict = self.model(x, c, poses, **kwargs)
+        loss, loss_dict = self.model(x, c, poses, poses_all, **kwargs)
         return loss, loss_dict
         
         
-    def get_batch_input(self, return_fs=False, return_pose=True, fs=3):
+    def get_batch_input(self, return_fs=False, return_poses=True, fs=3):
         filename_list, data_list, prompt_list, pointcloud_list, pose_list = self.get_data()
         prompts = prompt_list[0] 
         videos = data_list[0]
         # filenames = filename_list[0]
         pointcloud = pointcloud_list[0]
-        pose = pose_list[0] #(1, 2, 7)
+        poses = pose_list[0] #(1, 2, 7)
         
         if isinstance(videos, list):
             videos = torch.stack(videos, dim=0).to("cuda")
@@ -122,8 +122,8 @@ class DiffusionModule(nn.Module):
         pc_emb = self.model.pc_embedder(pointcloud)
         
 
-        pose_all = self.get_new_pose(pose)
-        print(pose_all.shape)
+        poses_all = self.get_new_pose(poses)
+        print(poses_all.shape)
         
         
         cond_emb = self.model.get_learned_conditioning(prompts)
@@ -139,8 +139,9 @@ class DiffusionModule(nn.Module):
 
         out = [z, cond]
         
-        if return_pose:
-            out.append(pose)
+        if return_poses:
+            out.append(poses)
+            out.append(poses_all)
             
         if return_fs:
             out.append(fs)
@@ -245,23 +246,11 @@ class DiffusionModule(nn.Module):
         return prompt_list
     
     def get_new_pose(self, original_pose, num_views=14):
-        """
-        根据两个初始相机的位姿生成一个椭圆轨道，并在轨道上生成新的视角和位姿。
-
-        参数:
-            original_pose (torch.Tensor 或 np.ndarray): 包含两个相机位姿的张量 (1, 2, 7)。
-            num_views (int): 需要生成的新视角数量，默认为14。
-
-        返回:
-            torch.Tensor: 包含每个新视角的位姿 (R_new, t_new) 的张量，形状为 (16, 7)。
-        """
         # 确保 original_pose 是 NumPy 数组
         if isinstance(original_pose, np.ndarray):
             pose_array = original_pose
         else:
             pose_array = original_pose.detach().cpu().numpy()  # 确保是 NumPy 数据
-
-        print("original_pose shape:", pose_array.shape)  # (1, 2, 7)
 
         # 提取第一相机的四元数和平移向量
         q1 = pose_array[0, 0, :4]  # (4,) 四元数

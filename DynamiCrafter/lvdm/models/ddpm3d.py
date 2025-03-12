@@ -708,11 +708,11 @@ class LatentDiffusion(DDPM):
 
         return out
 
-    def forward(self, x, c, poses=None, **kwargs):
+    def forward(self, x, c, poses=None, poses_all=None, **kwargs):
         t = torch.randint(0, self.num_timesteps, (x.shape[0],), device=self.device).long()
         if self.use_dynamic_rescale:
             x = x * extract_into_tensor(self.scale_arr, t, x.shape)
-        return self.p_losses(x, c, t, poses, **kwargs)
+        return self.p_losses(x, c, t, poses, poses_all, **kwargs)
 
     def shared_step(self, batch, random_uncond, **kwargs):
         x, c = self.get_batch_input(batch, random_uncond=random_uncond)
@@ -737,7 +737,7 @@ class LatentDiffusion(DDPM):
         else:
             return x_recon, pose_pred
 
-    def p_losses(self, x_start, cond, t, poses=None, noise=None, **kwargs):
+    def p_losses(self, x_start, cond, t, poses=None, poses_all=None, noise=None, **kwargs):
         if self.noise_strength > 0:
             b, c, f, _, _ = x_start.shape
             offset_noise = torch.randn(b, c, f, 1, 1, device=x_start.device)
@@ -751,6 +751,8 @@ class LatentDiffusion(DDPM):
         model_output, pose_pred = self.apply_model(x_noisy, t, cond, poses, **kwargs)
         
         ##### TODO
+        if poses_all is not None:
+            print(poses_all.shape)
 
         loss_dict = {}
         prefix = 'train' if self.training else 'val'
