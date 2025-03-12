@@ -156,16 +156,16 @@ class DiffusionModule(nn.Module):
         return out
 
     # new_poses return (16, 7) 固定椭圆 没有限制在一个椭圆轨道之内
-    def get_new_pose(self, original_pose, num_views=14):
+    def get_new_pose(original_pose, num_views=14):
         """
-        根据两个初始相机的位姿生成一个椭圆轨道，并在轨道上生成新的视角和位姿。
+        根据两个初始相机的位姿生成一个椭圆轨道，并在轨道上生成新的视角和位姿，且仅在两个初始位姿之间。
 
         参数:
             original_pose (torch.Tensor 或 np.ndarray): 包含两个相机位姿的张量 (1, 2, 7)。
             num_views (int): 需要生成的新视角数量，默认为14。
 
         返回:
-            torch.Tensor: 包含每个新视角的位姿 (R_new, t_new) 的张量，形状为 (16, 7)。
+            torch.Tensor: 包含每个新视角的位姿 (R_new, t_new) 的张量，形状为 (num_views, 7)。
         """
         # 确保 original_pose 是 NumPy 数组
         if isinstance(original_pose, np.ndarray):
@@ -196,13 +196,25 @@ class DiffusionModule(nn.Module):
         a = np.linalg.norm(C1 - C2) / 2  # 长轴
         b = a / 2  # 短轴
 
+        # 计算两个相机视角之间的角度范围
+        angle1 = np.arctan2(C1[1] - center[1], C1[0] - center[0])  # 视角1的角度
+        angle2 = np.arctan2(C2[1] - center[1], C2[0] - center[0])  # 视角2的角度
+
+        # 确保角度按顺时针或逆时针顺序排列
+        if angle2 < angle1:
+            angle2 += 2 * np.pi  # 保证 angle2 大于 angle1
+
+        # 在两个视角之间均匀分布的角度
+        angles = np.linspace(angle1, angle2, num_views)  # 均匀采样角度
+
         # 生成椭圆轨道上的点
-        angles = np.linspace(0, 2 * np.pi, num_views)  # 均匀采样角度
-        ellipse_points = np.array([a * np.cos(angles), b * np.sin(angles), np.zeros(num_views)]).T  # (14,3)
+        ellipse_points = np.hstack([a * np.cos(angles).reshape(-1, 1),
+                                    b * np.sin(angles).reshape(-1, 1),
+                                    np.zeros((num_views, 1))])  # (num_views, 3)
 
         # 处理广播问题 (转换 center 为 (1,3) 以进行广播)
         center = center.reshape(1, 3)  # 确保形状匹配
-        ellipse_points += center  # (14,3) + (1,3) 可广播
+        ellipse_points = ellipse_points + center  # (num_views, 3) + (1, 3) 可广播
 
         # 计算每个点的位姿
         poses = []
@@ -235,6 +247,7 @@ class DiffusionModule(nn.Module):
             # 将四元数和平移向量合并为一个 7 维向量
             pose_new = np.concatenate([q_new, t_new.squeeze()])  # (7,)
 
+            # 添加新位姿到 poses 列表中
             poses.append(pose_new)
 
         # 将第一个和最后一个视角添加为原始位姿
