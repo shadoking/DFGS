@@ -32,6 +32,7 @@ from lvdm.common import (
     exists,
     default
 )
+import torch.nn.functional as F
 
 __conditioning_keys__ = {'concat': 'c_concat',
                          'crossattn': 'c_crossattn',
@@ -748,11 +749,7 @@ class LatentDiffusion(DDPM):
         
         x_noisy = self.q_sample(x_start=x_start, t=t, noise=noise)
 
-        model_output, pose_pred = self.apply_model(x_noisy, t, cond, poses, **kwargs)
-        
-        ##### TODO
-        if poses_all is not None:
-            print(poses_all.shape)
+        model_output, pose_pred = self.apply_model(x_noisy, t, cond, poses, **kwargs)           
 
         loss_dict = {}
         prefix = 'train' if self.training else 'val'
@@ -785,8 +782,16 @@ class LatentDiffusion(DDPM):
         loss_vlb = (self.lvlb_weights[t] * loss_vlb).mean()
         loss_dict.update({f'{prefix}/loss_vlb': loss_vlb})
         loss += (self.original_elbo_weight * loss_vlb)
+        
+        
+        # Pose
+        if poses_all is not None:
+            pose_loss = F.mse_loss(pose_pred, poses_all)
+            loss_dict.update({f'{prefix}/loss_pose': pose_loss})
+            
+        loss = loss_simple.mean() + 0.1 * pose_loss 
         loss_dict.update({f'{prefix}/loss': loss})
-
+        
         return loss, loss_dict  
 
     ### TRAIN_STEP

@@ -3,22 +3,19 @@ sys.path.insert(1, os.path.join(sys.path[0], '..'))
 from omegaconf import OmegaConf
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import numpy as np
 from transformers import logging as transf_logging
-import pytorch_lightning as pl
 from pytorch_lightning import seed_everything
 from utils.utils import instantiate_from_config
-from main.utils_train import get_trainer_callbacks, get_trainer_logger, get_trainer_strategy
 from main.utils_train import set_logger, init_workspace, load_checkpoints
-from lvdm.modules.encoders.condition import PointNetEncoder
 from plyfile import PlyData
 from einops import rearrange, repeat
 import torchvision.transforms as transforms
 from PIL import Image
 from tqdm import tqdm
-import time
 from read_write_model import read_images_binary
+from scipy.spatial.transform import Rotation as R
+
 
 def get_nondefault_trainer_args(args):
     parser = argparse.ArgumentParser()
@@ -90,8 +87,8 @@ class DiffusionModule(nn.Module):
              
     def training_step(self):
         loss, loss_dict = self.shared_step()
-        #self.model.log_dict(loss_dict, prog_bar=True, logger=True, on_step=True, on_epoch=True, sync_dist=False)
-        return loss
+        # self.model.log_dict(loss_dict, prog_bar=True, logger=True, on_step=True, on_epoch=True, sync_dist=False)
+        return loss, loss_dict
     
     def shared_step(self, **kwargs):
         x, c, poses, poses_all, fs = self.get_batch_input(return_fs=True)
@@ -121,10 +118,7 @@ class DiffusionModule(nn.Module):
         
         pc_emb = self.model.pc_embedder(pointcloud)
         
-
         poses_all = self.get_new_pose(poses)
-        print(poses_all.shape)
-        
         
         cond_emb = self.model.get_learned_conditioning(prompts)
         cond = {"c_crossattn": [torch.cat([cond_emb, img_emb, pc_emb], dim=1)]}
@@ -324,7 +318,7 @@ class DiffusionModule(nn.Module):
         # 转换为 torch.Tensor 并返回
         poses_tensor = torch.tensor(poses, dtype=torch.float32)
 
-        return poses_tensor.unsqueeze(0)
+        return poses_tensor.unsqueeze(0).to(self.device)
     
     def get_filelist(self, data_dir, postfixes):
         patterns = [os.path.join(data_dir, f"*.{postfix}") for postfix in postfixes]
@@ -356,7 +350,7 @@ class DiffusionModule(nn.Module):
             optimizer.zero_grad()
             
             with torch.amp.autocast('cuda'):
-                loss = self.training_step()
+                loss, loss_dict = self.training_step()
                 
             scaler.scale(loss).backward()
     
@@ -364,10 +358,6 @@ class DiffusionModule(nn.Module):
             scaler.update()
             optimizer.zero_grad()
             
-             # **计算剩余时间**
-            # elapsed_time = time.time() - start_time
-            # avg_time_per_epoch = elapsed_time / (epoch + 1)
-            # remaining_time = avg_time_per_epoch * (self.epochs - epoch - 1)
 
             if loss.item() < best_loss:
                 best_loss = loss.item()
@@ -376,7 +366,6 @@ class DiffusionModule(nn.Module):
             if epoch % self.save_every_n_epoch == 0:
                 torch.save(self.model.state_dict(), os.path.join(self.save_dir, f"model_{epoch}.ckpt"))
 
-            # print(f"Epoch {epoch+1}/{self.epochs} | Loss: {loss.item():.4f} | Remaining Time: {remaining_time:.2f}s")
             pbar.set_postfix({
                 "loss": f"{loss.item():.4f}",
                 "best_loss": f"{best_loss:.4f}"
