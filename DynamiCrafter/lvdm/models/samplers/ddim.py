@@ -110,7 +110,7 @@ class DDIMSampler(object):
             C, T, H, W = shape
             size = (batch_size, C, T, H, W)
 
-        samples, intermediates = self.ddim_sampling(conditioning, size,
+        samples, intermediates, pose_pred = self.ddim_sampling(conditioning, size,
                                                     callback=callback,
                                                     img_callback=img_callback,
                                                     quantize_denoised=quantize_x0,
@@ -129,7 +129,7 @@ class DDIMSampler(object):
                                                     fs=fs,
                                                     guidance_rescale=guidance_rescale,
                                                     **kwargs)
-        return samples, intermediates
+        return samples, intermediates, pose_pred
 
     @torch.no_grad()
     def ddim_sampling(self, cond, shape,
@@ -192,7 +192,7 @@ class DDIMSampler(object):
                                       **kwargs)
             
 
-            img, pred_x0 = outs
+            img, pred_x0, pose_pred = outs
             if callback: callback(i)
             if img_callback: img_callback(pred_x0, i)
 
@@ -200,7 +200,7 @@ class DDIMSampler(object):
                 intermediates['x_inter'].append(img)
                 intermediates['pred_x0'].append(pred_x0)
 
-        return img, intermediates
+        return img, intermediates, pose_pred
 
     @torch.no_grad()
     def p_sample_ddim(self, x, c, t, index, repeat_noise=False, use_original_steps=False, quantize_denoised=False,
@@ -214,12 +214,12 @@ class DDIMSampler(object):
             is_video = False
 
         if unconditional_conditioning is None or unconditional_guidance_scale == 1.:
-            model_output = self.model.apply_model(x, t, c, **kwargs) # unet denoiser
+            model_output, pose_pred = self.model.apply_model(x, t, c, poses=None, **kwargs) # unet denoiser
         else:
             ### do_classifier_free_guidance
             if isinstance(c, torch.Tensor) or isinstance(c, dict):
-                e_t_cond = self.model.apply_model(x, t, c, **kwargs)
-                e_t_uncond = self.model.apply_model(x, t, unconditional_conditioning, **kwargs)
+                e_t_cond, pose_pred = self.model.apply_model(x, t, c, poses=None, **kwargs)
+                e_t_uncond, pose_pred = self.model.apply_model(x, t, unconditional_conditioning, poses=None, **kwargs)
             else:
                 raise NotImplementedError
 
@@ -276,7 +276,7 @@ class DDIMSampler(object):
     
         x_prev = a_prev.sqrt() * pred_x0 + dir_xt + noise
 
-        return x_prev, pred_x0
+        return x_prev, pred_x0, pose_pred
 
     @torch.no_grad()
     def decode(self, x_latent, cond, t_start, unconditional_guidance_scale=1.0, unconditional_conditioning=None,

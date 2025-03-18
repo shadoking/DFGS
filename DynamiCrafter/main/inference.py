@@ -18,7 +18,7 @@ from utils.utils import instantiate_from_config
 import random
 from plyfile import PlyData
 import numpy as np
-from lvdm.modules.encoders.condition import PointNetEncoder
+import imageio
 
 
 def get_filelist(data_dir, postfixes):
@@ -154,6 +154,25 @@ def save_results(prompt, samples, filename, fakedir, fps=8, loop=False):
         path = os.path.join(savedirs[idx], filename)
         torchvision.io.write_video(path, grid, fps=fps, video_codec='h264', options={'crf': '10'}) ## crf indicates the quality
 
+def save_results_iamges(prompt, samples, filename, save_dir):
+    prompt = prompt[0] if isinstance(prompt, list) else prompt
+    
+    videos = [samples]
+    for idx, video in enumerate(videos):
+        if video is None:
+            continue
+        video = video.detach().cpu()
+        video = torch.clamp(video.float(), -1., 1.)
+        n = video.shape[0]
+        for i in range(n):
+            grid = video[i,...]
+            grid = (grid + 1.0) / 2.0
+            grid = (grid * 255).permute(1, 2, 3, 0).to(torch.uint8) #thwc
+            t = grid.shape[0]
+            for j in range(t):
+                path = os.path.join(save_dir, f"{filename.split('.')[0]}_frame{j}.png")
+                frame = grid[j] #hwc
+                imageio.imwrite(path, frame)
 
 def save_results_seperate(prompt, samples, filename, fakedir, fps=10, loop=False):
     prompt = prompt[0] if isinstance(prompt, list) else prompt
@@ -251,7 +270,7 @@ def image_guided_synthesis(model, prompts, videos, pointcloud, noise_shape, n_sa
             cond_z0 = None
             
         if ddim_sampler is not None:
-            samples, _ = ddim_sampler.sample(S=ddim_steps,
+            samples, _, pose_pred = ddim_sampler.sample(S=ddim_steps,
                                             conditioning=cond,
                                             batch_size=batch_size,
                                             shape=noise_shape[1:],
@@ -273,7 +292,7 @@ def image_guided_synthesis(model, prompts, videos, pointcloud, noise_shape, n_sa
         batch_variants.append(batch_images)
     ## variants, batch, c, t, h, w
     batch_variants = torch.stack(batch_variants)
-    return batch_variants.permute(1, 0, 2, 3, 4, 5)
+    return batch_variants.permute(1, 0, 2, 3, 4, 5),  pose_pred
 
 
 def run_inference(args, gpu_num, gpu_no):
@@ -302,11 +321,10 @@ def run_inference(args, gpu_num, gpu_no):
     print(f'Inference with {n_frames} frames')
     noise_shape = [args.bs, channels, n_frames, h, w]
 
-    fakedir = os.path.join(args.savedir, "samples")
-    fakedir_separate = os.path.join(args.savedir, "samples_separate")
+    # fakedir = os.path.join(args.savedir, "samples")
+    # fakedir_separate = os.path.join(args.savedir, "samples_separate")
 
     # os.makedirs(fakedir, exist_ok=True)
-    os.makedirs(fakedir_separate, exist_ok=True)
 
     ## prompt file setting
     assert os.path.exists(args.prompt_dir), "Error: prompt file Not Found!"
@@ -334,16 +352,18 @@ def run_inference(args, gpu_num, gpu_no):
             else:
                 videos = videos.unsqueeze(0).to("cuda")
 
-            batch_samples = image_guided_synthesis(model, prompts, videos, pointcloud, noise_shape, args.n_samples, args.ddim_steps, args.ddim_eta, \
+            batch_samples, pose_pred = image_guided_synthesis(model, prompts, videos, pointcloud, noise_shape, args.n_samples, args.ddim_steps, args.ddim_eta, \
                                 args.unconditional_guidance_scale, args.cfg_img, args.frame_stride, args.text_input, args.multiple_cond_cfg, args.loop, args.interp, args.timestep_spacing, args.guidance_rescale)
-
+            
+            # torch.save(pose_pred, os.path.join(args.savedir, "pose.pth"))
             ## save each example individually
             for nn, samples in enumerate(batch_samples):
                 ## samples : [n_samples,c,t,h,w]
                 prompt = prompts[nn]
                 filename = filenames[nn]
                 # save_results(prompt, samples, filename, fakedir, fps=8, loop=args.loop)
-                save_results_seperate(prompt, samples, filename, fakedir, fps=8, loop=args.loop)
+                save_results_seperate(prompt, samples, filename, args.savedir, fps=8, loop=args.loop)
+                save_results_iamges(prompt, samples, filename, args.savedir)
 
     print(f"Saved in {args.savedir}. Time used: {(time.time() - start):.2f} seconds")
 

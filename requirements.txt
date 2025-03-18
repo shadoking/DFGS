@@ -24,5 +24,6 @@ tensorboard
 fairscale
 av
 timm
+imageio
 # h5py
 # lmdb

@@ -99,7 +99,7 @@ class DiffusionModule(nn.Module):
     def shared_step(self, **kwargs):
         x, c, poses, fs = self.get_batch_input(return_fs=True)
         # kwargs.update({"fs": fs.long()})
-        loss, loss_dict = self.model(x, c, poses, **kwargs)
+        loss, loss_dict = self.model(x, c, None, **kwargs)
         return loss, loss_dict
 
     def get_batch_input(self, return_fs=False, return_pose=True, fs=3):
@@ -123,7 +123,6 @@ class DiffusionModule(nn.Module):
 
         
         pc_emb = self.model.pc_embedder(pointcloud)
-        
         poses_all = self.get_new_pose(poses)
         
 
@@ -165,8 +164,6 @@ class DiffusionModule(nn.Module):
             pose_array = original_pose
         else:
             pose_array = original_pose.detach().cpu().numpy()  # 确保是 NumPy 数据
-
-        print("original_pose shape:", pose_array.shape)  # (1, 2, 7)
 
         # 提取第一相机的四元数和平移向量
         q1 = pose_array[0, 0, :4]  # (4,) 四元数
@@ -250,8 +247,8 @@ class DiffusionModule(nn.Module):
         poses.insert(0, q1_t)  # 在最前面添加原始第一个相机位姿
         poses.append(q2_t)  # 在最后添加原始第二个相机位姿
 
-        # 转换为 torch.Tensor 并返回
-        poses_tensor = torch.tensor(poses, dtype=torch.float32)
+        poses_np = np.array(poses, dtype=np.float32)  
+        poses_tensor = torch.from_numpy(poses_np)
         return poses_tensor.unsqueeze(0).to(self.device)
     
 
@@ -299,9 +296,13 @@ class DiffusionModule(nn.Module):
                 image_tensor1 = transform(image1).unsqueeze(1)  # [c,1,h,w]
                 image2 = Image.open(file_list[2 * idx + 1]).convert('RGB')
                 image_tensor2 = transform(image2).unsqueeze(1)  # [c,1,h,w]
+                image3 = Image.open(file_list[2 * idx + 2]).convert('RGB')
+                image_tensor3 = transform(image3).unsqueeze(1)  # [c,1,h,w]
                 frame_tensor1 = repeat(image_tensor1, 'c t h w -> c (repeat t) h w', repeat=video_frames // 2)
                 frame_tensor2 = repeat(image_tensor2, 'c t h w -> c (repeat t) h w', repeat=video_frames // 2)
-                frame_tensor = torch.cat([frame_tensor1, frame_tensor2], dim=1)
+                frame_tensor3 = repeat(image_tensor3, 'c t h w -> c (repeat t) h w', repeat=video_frames // 2)
+                frame_tensor = torch.cat([frame_tensor1, frame_tensor2, frame_tensor3], dim=1)
+                
                 _, filename = os.path.split(file_list[idx * 2])
             else:
                 image = Image.open(file_list[idx]).convert('RGB')
@@ -345,7 +346,7 @@ class DiffusionModule(nn.Module):
             pose = np.concatenate([qvec, tvec])
             poses.append(pose)
 
-        poses_np = np.array(poses, dtype=np.float32)  # 转为 NumPy 数组
+        poses_np = np.array(poses, dtype=np.float32) 
         poses_tensor = torch.from_numpy(poses_np)
         return poses_tensor.unsqueeze(0).to(self.device)  # [2, 7]
 
@@ -382,10 +383,11 @@ class DiffusionModule(nn.Module):
         optimizer = self.configure_optimizers()
         scaler = torch.amp.GradScaler('cuda')
         # start_time = time.time()
-        best_loss = float("inf")
+        # best_loss = float("inf")
         pbar = tqdm(range(1, self.epochs + 1), desc="Training Progress", unit="epoch")
+        self.model.train()
+        prefix = 'train' if self.training else 'val'
         for epoch in pbar:
-            self.model.train()
             optimizer.zero_grad()
 
             with torch.amp.autocast('cuda'):
@@ -396,18 +398,17 @@ class DiffusionModule(nn.Module):
             scaler.step(optimizer)
             scaler.update()
             optimizer.zero_grad()
-            
 
-            if loss.item() < best_loss:
-                best_loss = loss.item()
-                torch.save(self.model.state_dict(), os.path.join(save_dir, "best_model.ckpt"))
+            # if loss.item() < best_loss:
+            #     best_loss = loss.item()
+            #     torch.save(self.model.state_dict(), os.path.join(save_dir, "best_model.ckpt"))
 
             if epoch % self.save_every_n_epoch == 0:
                 torch.save(self.model.state_dict(), os.path.join(self.save_dir, f"model_{epoch}.ckpt"))
 
             pbar.set_postfix({
-                "loss": f"{loss.item():.4f}",
-                "best_loss": f"{best_loss:.4f}"
+                "loss": f"{loss.item():.4f}"
+                # "pose_loss": f"{loss_dict.get(f'{prefix}/loss_pose', torch.tensor(0.0)).item():.4f}"
             })
 
         # torch.save(self.model.state_dict(), os.path.join(save_dir, "last.ckpt"))
@@ -432,12 +433,15 @@ if __name__ == '__main__':
     parser.add_argument("--auto_resume", action='store_true', default=False, help="resume from full-info checkpoint")
     parser.add_argument("--auto_resume_weight_only", action='store_true', default=False,
                         help="resume from weight-only checkpoint")
-    parser.add_argument("--debug", "-d", action='store_true', default=False, help="enable post-mortem debugging")
+    parser.add_argument("--debug", action='store_true', default=False, help="enable post-mortem debugging")
+    parser.add_argument("--data_dir", "-d", type=str, default="../data/prompts")
 
     name = "training_512_v1.0"
     config_file = "configs/" + name + "/config_interp.yaml"
     save_dir = "checkpoints"
-    data_dir = "../data/prompts"
+   # data_dir = "../data/prompts"
 
-    diffusionModule = DiffusionModule(parser, [config_file], save_dir, data_dir, epochs=20, save_every_n_epoch=20)
+    args = parser.parse_args()
+
+    diffusionModule = DiffusionModule(parser, [config_file], save_dir, args.data_dir, epochs=10, save_every_n_epoch=5)
     diffusionModule.train()

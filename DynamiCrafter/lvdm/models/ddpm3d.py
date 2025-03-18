@@ -749,7 +749,7 @@ class LatentDiffusion(DDPM):
         
         x_noisy = self.q_sample(x_start=x_start, t=t, noise=noise)
 
-        model_output, pose_pred = self.apply_model(x_noisy, t, cond, poses, **kwargs)           
+        model_output, pose_pred = self.apply_model(x_noisy, t, cond, poses_all, **kwargs)           
 
         loss_dict = {}
         prefix = 'train' if self.training else 'val'
@@ -783,13 +783,12 @@ class LatentDiffusion(DDPM):
         loss_dict.update({f'{prefix}/loss_vlb': loss_vlb})
         loss += (self.original_elbo_weight * loss_vlb)
         
-        
         # Pose
         if poses_all is not None:
             pose_loss = F.mse_loss(pose_pred, poses_all)
             loss_dict.update({f'{prefix}/loss_pose': pose_loss})
-            
-        loss = loss_simple.mean() + 0.1 * pose_loss 
+            loss += 0.1 * pose_loss 
+        
         loss_dict.update({f'{prefix}/loss': loss})
         
         return loss, loss_dict  
