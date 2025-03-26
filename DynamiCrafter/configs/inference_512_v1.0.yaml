@@ -115,11 +115,3 @@ model:
         seq_length: 16
         input_channels: 6
         freeze_proj: False
-
-    pose_stage_config:
-      target: lvdm.modules.encoders.condition.PoseEncoder
-      params:
-        input_dim: 7
-        output_dim: 1024
-        freeze_proj: False
-

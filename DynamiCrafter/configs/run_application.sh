@@ -1,7 +1,7 @@
 ckpt=checkpoints/model.ckpt
 config=configs/inference_512_v1.0.yaml
 
-prompt_dir=../data/prompts
+prompt_dir=$1
 res_dir="results"
 
 FS=5 ## This model adopts FPS=5, range recommended: 5-30 (smaller value -> larger motion)

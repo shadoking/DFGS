@@ -709,11 +709,11 @@ class LatentDiffusion(DDPM):
 
         return out
 
-    def forward(self, x, c, poses=None, poses_all=None, **kwargs):
+    def forward(self, x, c, **kwargs):
         t = torch.randint(0, self.num_timesteps, (x.shape[0],), device=self.device).long()
         if self.use_dynamic_rescale:
             x = x * extract_into_tensor(self.scale_arr, t, x.shape)
-        return self.p_losses(x, c, t, poses, poses_all, **kwargs)
+        return self.p_losses(x, c, t, **kwargs)
 
     def shared_step(self, batch, random_uncond, **kwargs):
         x, c = self.get_batch_input(batch, random_uncond=random_uncond)
@@ -721,7 +721,7 @@ class LatentDiffusion(DDPM):
 
         return loss, loss_dict
 
-    def apply_model(self, x_noisy, t, cond, poses=None, **kwargs):
+    def apply_model(self, x_noisy, t, cond, **kwargs):
         if isinstance(cond, dict):
             # hybrid case, cond is exptected to be a dict
             pass
@@ -731,14 +731,14 @@ class LatentDiffusion(DDPM):
             key = 'c_concat' if self.model.conditioning_key == 'concat' else 'c_crossattn'
             cond = {key: cond}
 
-        x_recon, pose_pred = self.model(x_noisy, t, poses=poses, **cond, **kwargs)
+        x_recon = self.model(x_noisy, t, **cond, **kwargs)
 
         if isinstance(x_recon, tuple):
-            return x_recon[0], pose_pred
+            return x_recon[0]
         else:
-            return x_recon, pose_pred
+            return x_recon
 
-    def p_losses(self, x_start, cond, t, poses=None, poses_all=None, noise=None, **kwargs):
+    def p_losses(self, x_start, cond, t, noise=None, **kwargs):
         if self.noise_strength > 0:
             b, c, f, _, _ = x_start.shape
             offset_noise = torch.randn(b, c, f, 1, 1, device=x_start.device)
@@ -746,10 +746,9 @@ class LatentDiffusion(DDPM):
         else:
             noise = default(noise, lambda: torch.randn_like(x_start))
        
-        
         x_noisy = self.q_sample(x_start=x_start, t=t, noise=noise)
 
-        model_output, pose_pred = self.apply_model(x_noisy, t, cond, poses_all, **kwargs)           
+        model_output = self.apply_model(x_noisy, t, cond, **kwargs)           
 
         loss_dict = {}
         prefix = 'train' if self.training else 'val'
@@ -782,12 +781,6 @@ class LatentDiffusion(DDPM):
         loss_vlb = (self.lvlb_weights[t] * loss_vlb).mean()
         loss_dict.update({f'{prefix}/loss_vlb': loss_vlb})
         loss += (self.original_elbo_weight * loss_vlb)
-        
-        # Pose
-        if poses_all is not None:
-            pose_loss = F.mse_loss(pose_pred, poses_all)
-            loss_dict.update({f'{prefix}/loss_pose': pose_loss})
-            loss += 0.1 * pose_loss 
         
         loss_dict.update({f'{prefix}/loss': loss})
         
@@ -1038,13 +1031,12 @@ class LatentDiffusion(DDPM):
         return lr_scheduler
 
 class LatentVisualDiffusion(LatentDiffusion):
-    def __init__(self, img_cond_stage_config, image_proj_stage_config, point_stage_config, pose_stage_config, freeze_embedder=True, image_proj_model_trainable=True, *args, **kwargs):
+    def __init__(self, img_cond_stage_config, image_proj_stage_config, point_stage_config, freeze_embedder=True, image_proj_model_trainable=True, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.image_proj_model_trainable = image_proj_model_trainable
         self._init_embedder(img_cond_stage_config, freeze_embedder)
         self._init_img_ctx_projector(image_proj_stage_config, image_proj_model_trainable)
         self._init_point_embedder(point_stage_config)
-        self._init_pose_embedder(pose_stage_config)
 
     def _init_img_ctx_projector(self, config, trainable):
         self.image_proj_model = instantiate_from_config(config)
@@ -1068,14 +1060,6 @@ class LatentVisualDiffusion(LatentDiffusion):
             self.pc_embedder.eval()
             self.pc_embedder.train = disabled_train
             for param in self.pc_embedder.parameters():
-                param.requires_grad = False
-    
-    def _init_pose_embedder(self, config, freeze=False):
-        self.pose_embedder = instantiate_from_config(config)
-        if freeze:
-            self.pose_embedder.eval()
-            self.pose_embedder.train = disabled_train
-            for param in self.pose_embedder.parameters():
                 param.requires_grad = False
 
     def shared_step(self, batch, random_uncond, **kwargs):

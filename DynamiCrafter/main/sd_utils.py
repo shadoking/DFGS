@@ -95,52 +95,76 @@ class DiffusionModule(nn.Module):
         # self.model.log_dict(loss_dict, prog_bar=True, logger=True, on_step=True, on_epoch=True, sync_dist=False)
         return loss, loss_dict
     
-
     def shared_step(self, **kwargs):
-        x, c, poses, fs = self.get_batch_input(return_fs=True)
+        x, c, fs = self.get_batch_input(return_fs=True)
         # kwargs.update({"fs": fs.long()})
-        loss, loss_dict = self.model(x, c, None, **kwargs)
+        loss, loss_dict = self.model(x, c, **kwargs)
         return loss, loss_dict
 
-    def get_batch_input(self, return_fs=False, return_pose=True, fs=3):
-        filename_list, data_list, prompt_list, pointcloud_list, pose_list = self.get_data()
+    def get_batch_input(self, return_fs=False, fs=3, height=512, width=512, n_frames=16):
+        os.makedirs(self.save_dir, exist_ok=True)
+
+        assert os.path.exists(self.prompt_dir)
+        data_list, prompt_list, pointcloud_list, data_all_list, fn = self.load_data_prompts(self.prompt_dir,
+                                                                            video_size=(
+                                                                            height, width),
+                                                                            video_frames=n_frames,
+                                                                            interp=True)
         prompts = prompt_list[0]
-        videos = data_list[0]
-        # filenames = filename_list[0]
+        # images = data_list[0]
+        images = data_all_list[0]
         pointcloud = pointcloud_list[0]
-        poses = pose_list[0]  # (1, 2, 7)
+        images_all = data_all_list[0]
 
-        if isinstance(videos, list):
-            videos = torch.stack(videos, dim=0).to("cuda")
+        if isinstance(images, list):
+            videos = torch.stack(images, dim=0).to("cuda")
         else:
-            videos = videos.unsqueeze(0).to("cuda")
-
+            videos = images.unsqueeze(0).to("cuda") #[1,3,16,512,512]
+            videos_all = images_all.unsqueeze(0).to("cuda") #[1,3,16,512,512]
         fs = torch.tensor([fs], dtype=torch.long, device=self.device)
 
-        img = videos[:, :, 0]  # bchw
-        img_emb = self.model.embedder(img)  ## blc
-        img_emb = self.model.image_proj_model(img_emb)
-
+        mid_idx = videos_all.shape[2] // 2  # 中间帧索引
+        img_first = videos_all[:, :, 0]  # 首帧
+        img_mid = videos_all[:, :, mid_idx]  # 中间帧
+        img_last = videos_all[:, :, -1] 
         
+        img_emb_first = self.model.embedder(img_first)  # [B, L, C]
+        img_emb_mid = self.model.embedder(img_mid)
+        img_emb_last = self.model.embedder(img_last)
+
+        img_emb_first = self.model.image_proj_model(img_emb_first)
+        img_emb_mid = self.model.image_proj_model(img_emb_mid)
+        img_emb_last = self.model.image_proj_model(img_emb_last)
+        img_emb = torch.cat([img_emb_first, img_emb_mid, img_emb_last], dim=1)  # [B, 3L, C]
+        
+        # img = videos[:, :, 0]  # bchw  [1,3,512,512]
+        # img_emb = self.model.embedder(img)  ## blc
+        # img_emb = self.model.image_proj_model(img_emb)
+        # img_emb = torch.cat([img_emb_first, img_emb_last], dim=1) 
+
         pc_emb = self.model.pc_embedder(pointcloud)
-        poses_all = self.get_new_pose(poses)
         
-
         cond_emb = self.model.get_learned_conditioning(prompts)
         cond = {"c_crossattn": [torch.cat([cond_emb, img_emb, pc_emb], dim=1)]}
         # cond = {"c_crossattn": [torch.cat([cond_emb, img_emb], dim=1)]}
+        
+        # masks = self.generate_mask(images_all)
+
         if self.model.model.conditioning_key == 'hybrid':
             z = get_latent_z(self.model, videos)  # b c t h w
+            # masks_z = get_latent_z(self.model, masks)
             img_cat_cond = torch.zeros_like(z)
+            
+            # if fn > 2:
+            #     step = z.shape[2] // fn
+            #     for i in range(1, fn - 1):
+            #         idx = i * step
+            #         img_cat_cond[:, :, idx, :, :] = z[:, :, idx, :, :] * (1 - masks_z[:, :, idx, :, :])
             img_cat_cond[:, :, 0, :, :] = z[:, :, 0, :, :]
             img_cat_cond[:, :, -1, :, :] = z[:, :, -1, :, :]
-
             cond["c_concat"] = [img_cat_cond]  # b c 1 h w [1, 4, 16, 64, 64]
 
         out = [z, cond]
-
-        if return_pose:
-            out.append(poses_all)
 
         if return_fs:
             out.append(fs)
@@ -250,20 +274,15 @@ class DiffusionModule(nn.Module):
         poses_np = np.array(poses, dtype=np.float32)  
         poses_tensor = torch.from_numpy(poses_np)
         return poses_tensor.unsqueeze(0).to(self.device)
+
+    def generate_mask(self, image, threshold=0.1):
+        mean_image = image.mean(dim=(0, 2, 3), keepdim=True)  # [c, 1, 1, 1]
+        edge_map = torch.abs(image - mean_image)  # [c, t, h, w]
+        mask = (edge_map.mean(dim=0, keepdim=True) < threshold).float()  # [1, t, h, w]
+        mask = mask.expand(image.shape)  # [c, t, h, w]，让 mask 复制到所有通道
+        return mask.unsqueeze(0).to("cuda")
     
-
-    def get_data(self, height=512, width=512, n_frames=16):
-        os.makedirs(self.save_dir, exist_ok=True)
-
-        assert os.path.exists(self.prompt_dir)
-        filename_list, data_list, prompt_list, pointcloud_list, pose_list = self.load_data_prompts(self.prompt_dir,
-                                                                                                   video_size=(
-                                                                                                   height, width),
-                                                                                                   video_frames=n_frames,
-                                                                                                   interp=True)
-
-        return filename_list, data_list, prompt_list, pointcloud_list, pose_list
-
+    
     def load_data_prompts(self, data_dir, video_size=(256, 256), video_frames=16, interp=False):
         transform = transforms.Compose([
             transforms.Resize(min(video_size)),
@@ -285,38 +304,45 @@ class DiffusionModule(nn.Module):
         file_list = self.get_filelist(data_dir, ['jpg', 'png', 'jpeg', 'JPEG', 'PNG', 'JPG'])
         # assert len(file_list) == n_samples, "Error: data and prompts are NOT paired!"
         data_list = []
-        filename_list = []
+        data_all_list = []
         pointcloud_list = []
-        pose_list = []
         prompt_list = self.load_prompts(prompt_file[default_idx])
         n_samples = len(prompt_list)
         for idx in range(n_samples):
             if interp:
-                image1 = Image.open(file_list[2 * idx]).convert('RGB')
+                image_tensors = []
+                fn = len(file_list)
+                for img_file in file_list:
+                    image = Image.open(img_file).convert('RGB')
+                    image_tensor = transform(image).unsqueeze(1)  # [c,1,h,w]
+                    image_tensors.append(image_tensor)
+                    
+                frame_tensors = [
+                    repeat(img, 'c t h w -> c (repeat t) h w', repeat=video_frames // fn)
+                    for img in image_tensors
+                ]
+                
+                frame_tensor = torch.cat(frame_tensors, dim=1) 
+                data_all_list.append(frame_tensor)
+               
+                image1 = Image.open(file_list[0]).convert('RGB')
                 image_tensor1 = transform(image1).unsqueeze(1)  # [c,1,h,w]
-                image2 = Image.open(file_list[2 * idx + 1]).convert('RGB')
+                # image2 = Image.open(file_list[2 * idx + 1]).convert('RGB')
+                image2 = Image.open(file_list[-1]).convert('RGB')
                 image_tensor2 = transform(image2).unsqueeze(1)  # [c,1,h,w]
-                image3 = Image.open(file_list[2 * idx + 2]).convert('RGB')
-                image_tensor3 = transform(image3).unsqueeze(1)  # [c,1,h,w]
+                
                 frame_tensor1 = repeat(image_tensor1, 'c t h w -> c (repeat t) h w', repeat=video_frames // 2)
                 frame_tensor2 = repeat(image_tensor2, 'c t h w -> c (repeat t) h w', repeat=video_frames // 2)
-                frame_tensor3 = repeat(image_tensor3, 'c t h w -> c (repeat t) h w', repeat=video_frames // 2)
-                frame_tensor = torch.cat([frame_tensor1, frame_tensor2, frame_tensor3], dim=1)
-                
-                _, filename = os.path.split(file_list[idx * 2])
+                frame_tensor = torch.cat([frame_tensor1, frame_tensor2], dim=1)
             else:
                 image = Image.open(file_list[idx]).convert('RGB')
                 image_tensor = transform(image).unsqueeze(1)  # [c,1,h,w]
                 frame_tensor = repeat(image_tensor, 'c t h w -> c (repeat t) h w', repeat=video_frames)
-                _, filename = os.path.split(file_list[idx])
 
             data_list.append(frame_tensor)
-            filename_list.append(filename)
         pointcloud_tensor = self.load_pointcloud(os.path.join(data_dir, "points3D.ply"))
-        pose_tensor = self.load_pose(os.path.join(data_dir, "images.bin"))
         pointcloud_list.append(pointcloud_tensor)
-        pose_list.append(pose_tensor)
-        return filename_list, data_list, prompt_list, pointcloud_list, pose_list
+        return data_list, prompt_list, pointcloud_list, data_all_list, fn
 
     def load_pointcloud(self, ply_file, sample_ratio=1 / 8):
         plydata = PlyData.read(ply_file)
@@ -443,5 +469,5 @@ if __name__ == '__main__':
 
     args = parser.parse_args()
 
-    diffusionModule = DiffusionModule(parser, [config_file], save_dir, args.data_dir, epochs=10, save_every_n_epoch=5)
+    diffusionModule = DiffusionModule(parser, [config_file], save_dir, args.data_dir, epochs=20, save_every_n_epoch=10)
     diffusionModule.train()

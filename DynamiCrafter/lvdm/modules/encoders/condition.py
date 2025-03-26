@@ -467,22 +467,6 @@ class PointNetEncoder(AbstractEncoder):
         return x  # 直接输出[B,128,1024], 移除CLS token
     
 
-class PoseEncoder(AbstractEncoder):
-    def __init__(self, input_dim=7, output_dim=1024, freeze_proj=False):
-        super().__init__()
-        self.mlp = nn.Sequential(
-            nn.Linear(input_dim, 256),
-            nn.ReLU(),
-            nn.Linear(256, output_dim)
-        )
-        
-        if freeze_proj:
-            for param in self.proj.parameters():
-                param.requires_grad = False
-    
-    def forward(self, pose):
-        return self.mlp(pose)
-
 
 
 

@@ -489,26 +489,6 @@ class UNetModel(nn.Module):
 
         ## Middle Block
         self.middle_block = TimestepEmbedSequential(*layers)
-        
-        ## Pose Block
-        pose_dim = 7 # rot 4, pos 3
-        self.pose_embedding = nn.Sequential(
-            nn.Linear(pose_dim, self.model_channels),   
-            nn.SiLU(),
-            nn.Linear(self.model_channels, self.model_channels * 4) 
-        )
-        
-        self.pose_head = nn.TransformerEncoder(
-            nn.TransformerEncoderLayer(
-                d_model=self.model_channels, 
-                nhead=8, 
-                dim_feedforward=1024,
-                batch_first=True  
-            ),
-            num_layers=2
-        )
-        self.pose_out = nn.Linear(self.model_channels, pose_dim) 
-        self.pose_avgpool = nn.AdaptiveAvgPool2d(1)
 
         ## Output Block
         self.output_blocks = nn.ModuleList([])
@@ -565,16 +545,11 @@ class UNetModel(nn.Module):
             zero_module(conv_nd(dims, model_channels, out_channels, 3, padding=1)),
         )
 
-    def forward(self, x, timesteps, context=None, features_adapter=None, fs=None, poses=None, **kwargs):
+    def forward(self, x, timesteps, context=None, features_adapter=None, fs=None, **kwargs):
         b,_,t,_,_ = x.shape
         t_emb = timestep_embedding(timesteps, self.model_channels, repeat_only=False).type(x.dtype)
         emb = self.time_embed(t_emb)
-        
-        # if poses is not None:
-        #     pose_emb = self.pose_embedding(poses)  
-        #     # emb = emb + pose_emb[:, 0, :]
-        #     emb = emb + pose_emb
-        
+                
         ## repeat t times for context [(b t) 77 768] & time embedding
         ## check if we use per-frame image conditioning
         _, l_context, _ = context.shape
@@ -626,9 +601,4 @@ class UNetModel(nn.Module):
         # reshape back to (b c t h w)
         y = rearrange(y, '(b t) c h w -> b c t h w', b=b)
         
-        # h_spatial = h.mean(dim=[2, 3])  # (B*T, C)  # 取平均避免信息损失
-        # h_seq = h_spatial.view(b, t, self.model_channels)  # (B, T, C)
-        # poses_pred = self.pose_head(h_seq) 
-        # poses_pred = self.pose_out(poses_pred) # (B, T, 7)
-        
-        return y, None
+        return y
