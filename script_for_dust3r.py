@@ -16,6 +16,8 @@ from dust3r.utils.device import to_numpy
 from scipy.spatial.transform import Rotation
 import torchvision.transforms as tvf
 
+import open3d as o3d
+
 from scene.dataset_readers import storePly
 from utils.read_write_model import (
     Camera, BaseImage, Point3D, 
@@ -143,7 +145,12 @@ def save_images(sparse_path, c2ws, image_names):
     write_images_binary(images, output_image_bin_path)
     write_images_text(images, output_image_txt_path)
 
-def save_points(sparse_path, ori_points, images, mask, batch_indices='all', use_mask=True):
+def down_sample_points(points):
+    
+    
+    return 
+
+def save_points(sparse_path, ori_points, images, mask, batch_indices='all', use_mask=True, voxel_size=None):
     output_point_path = os.path.join(sparse_path,  "points3D.ply")
     
     # 根据点数选择
@@ -175,8 +182,18 @@ def save_points(sparse_path, ori_points, images, mask, batch_indices='all', use_
     else:
         points = selected_points.reshape(-1, 3)
         col = selected_images.reshape(-1, 3)
-        
-    colors = (col * 255).astype(np.uint8)
+    
+    if voxel_size is not None and voxel_size > 0:
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(points)
+        pcd.colors = o3d.utility.Vector3dVector(col) 
+                
+        down_pcd = pcd.voxel_down_sample(voxel_size=voxel_size)
+
+        points = np.asarray(down_pcd.points)
+        colors = (np.asarray(down_pcd.colors) * 255).astype(np.uint8)
+    else:
+        colors = (col * 255).astype(np.uint8)
     
     storePly(output_point_path, points, colors)
     
@@ -234,4 +251,4 @@ if __name__ == '__main__':
     save_images(sparse_path, c2ws, image_names)
     
     # points
-    save_points(sparse_path, ori_points, rsz_images, mask)
+    save_points(sparse_path, ori_points, rsz_images, mask, voxel_size=0.002)

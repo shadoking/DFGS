@@ -220,7 +220,14 @@ def get_latent_z(model, videos):
     z = rearrange(z, '(b t) c h w -> b c t h w', b=b, t=t)
     return z
 
-def image_guided_synthesis(model, prompts, videos, videos_all,fn, noise_shape, n_samples=1, ddim_steps=50, ddim_eta=1., \
+def generate_mask(image, threshold=0.1):
+    mean_image = image.mean(dim=(0, 2, 3), keepdim=True)  # [c, 1, 1, 1]
+    edge_map = torch.abs(image - mean_image)  # [c, t, h, w]
+    mask = (edge_map.mean(dim=0, keepdim=True) < threshold).float()  # [1, t, h, w]
+    mask = mask.expand(image.shape)  # [c, t, h, w]，让 mask 复制到所有通道
+    return mask.unsqueeze(0).to("cuda")
+
+def image_guided_synthesis(model, prompts, videos, videos_all, masks, fn, noise_shape, n_samples=1, ddim_steps=50, ddim_eta=1., \
                         unconditional_guidance_scale=1.0, cfg_img=None, fs=None, text_input=False, multiple_cond_cfg=False, loop=False, interp=False, timestep_spacing='uniform', guidance_rescale=0.0, **kwargs):
     ddim_sampler = DDIMSampler(model) if not multiple_cond_cfg else DDIMSampler_multicond(model)
     batch_size = noise_shape[0]
@@ -251,30 +258,33 @@ def image_guided_synthesis(model, prompts, videos, videos_all,fn, noise_shape, n
     cond_emb = model.get_learned_conditioning(prompts)
     cond = {"c_crossattn": [torch.cat([cond_emb, img_emb], dim=1)]}
     # cond = {"c_crossattn": [torch.cat([cond_emb, img_emb, pc_emb], dim=1)]}
-    # if model.model.conditioning_key == 'hybrid':
-    #     z = get_latent_z(model, videos_all)  # b c t h w
-    #     # masks_z = get_latent_z(model.model, masks)
-    #     img_cat_cond = torch.zeros_like(z)
-        
-    #     if fn > 2:
-    #         step = z.shape[2] // fn
-    #         for i in range(1, fn - 1):
-    #             idx = i * step
-    #             img_cat_cond[:, :, idx, :, :] = z[:, :, idx, :, :] 
-    #     img_cat_cond[:,:,0,:,:] = z[:,:,0,:,:]
-    #     img_cat_cond[:,:,-1,:,:] = z[:,:,-1,:,:]
-        
-    if model.model.conditioning_key == 'hybrid':
-        z = get_latent_z(model, videos) # b c t h w
-        if loop or interp:
-            img_cat_cond = torch.zeros_like(z)
-            img_cat_cond[:,:,0,:,:] = z[:,:,0,:,:]
-            img_cat_cond[:,:,-1,:,:] = z[:,:,-1,:,:]
-        else:
-            img_cat_cond = z[:,:,:1,:,:]
-            img_cat_cond = repeat(img_cat_cond, 'b c t h w -> b c (repeat t) h w', repeat=z.shape[2])
-        cond["c_concat"] = [img_cat_cond] # b c 1 h w
     
+    if model.model.conditioning_key == 'hybrid':
+        z = get_latent_z(model, videos_all)  # b c t h w
+        masks_z = get_latent_z(model, masks)
+        #z = z * (1 - masks_z)
+        img_cat_cond = torch.zeros_like(z)
+        
+        if fn > 2:
+            step = z.shape[2] // fn
+            for i in range(1, fn - 1):
+                idx = i * step
+                img_cat_cond[:, :, idx, :, :] = z[:, :, idx, :, :]  * (1 - masks_z[:, :, idx, :, :])
+        img_cat_cond[:,:,0,:,:] = z[:,:,0,:,:]
+        img_cat_cond[:,:,-1,:,:] = z[:,:,-1,:,:]
+        
+    # if model.model.conditioning_key == 'hybrid':
+    #     z = get_latent_z(model, videos) # b c t h w
+    #     masks_z = get_latent_z(model, masks)
+    #     if loop or interp:
+    #         img_cat_cond = torch.zeros_like(z)
+    #         img_cat_cond[:,:,0,:,:] = z[:,:,0,:,:]
+    #         img_cat_cond[:,:,-1,:,:] = z[:,:,-1,:,:]
+    #     else:
+    #         img_cat_cond = z[:,:,:1,:,:]
+    #         img_cat_cond = repeat(img_cat_cond, 'b c t h w -> b c (repeat t) h w', repeat=z.shape[2])
+        
+        cond["c_concat"] = [img_cat_cond] # b c 1 h w
     
     if unconditional_guidance_scale != 1.0:
         if model.uncond_type == "empty_seq":
@@ -324,7 +334,7 @@ def image_guided_synthesis(model, prompts, videos, videos_all,fn, noise_shape, n
                                             mask=cond_mask,
                                             x0=cond_z0,
                                             fs=fs,
-                                            timestep_spacing=timestep_spacing,
+                                            timestep_spacing=kwargs.update({"unconditional_conditioning_img_nonetext": None}),
                                             guidance_rescale=guidance_rescale,
                                             **kwargs
                                             )
@@ -386,8 +396,8 @@ def run_inference(args, gpu_num, gpu_no):
         else:
             videos = images.unsqueeze(0).to("cuda")
             videos_all = images_all.unsqueeze(0).to("cuda")
-
-        batch_samples = image_guided_synthesis(model, prompts, videos, videos_all, fn, noise_shape, args.n_samples, args.ddim_steps, args.ddim_eta, \
+        masks = generate_mask(images_all)
+        batch_samples = image_guided_synthesis(model, prompts, videos, videos_all,masks, fn, noise_shape, args.n_samples, args.ddim_steps, args.ddim_eta, \
                             args.unconditional_guidance_scale, args.cfg_img, args.frame_stride, args.text_input, args.multiple_cond_cfg, args.loop, args.interp, args.timestep_spacing, args.guidance_rescale)
         
         ## save each example individually

@@ -8,6 +8,7 @@ import numpy as np
 from transformers import logging as transf_logging
 from pytorch_lightning import seed_everything
 from utils.utils import instantiate_from_config
+from lvdm.models.samplers.ddim import DDIMSampler
 from main.utils_train import set_logger, init_workspace, load_checkpoints
 from plyfile import PlyData
 from einops import rearrange, repeat
@@ -15,7 +16,9 @@ import torchvision.transforms as transforms
 from PIL import Image
 from tqdm import tqdm
 from read_write_model import read_images_binary
-from scipy.spatial.transform import Rotation as R
+import torchvision
+
+
 
 
 def get_nondefault_trainer_args(args):
@@ -31,6 +34,28 @@ def get_latent_z(model, videos):
     z = rearrange(z, '(b t) c h w -> b c t h w', b=b, t=t)
     return z
 
+def save_results_seperate(prompt, samples, filename, fakedir, fps=10, loop=False):
+    prompt = prompt[0] if isinstance(prompt, list) else prompt
+
+    ## save video
+    videos = [samples]
+    savedirs = [fakedir]
+    for idx, video in enumerate(videos):
+        if video is None:
+            continue
+        # b,c,t,h,w
+        video = video.detach().cpu()
+        if loop: # remove the last frame
+            video = video[:,:,:-1,...]
+        video = torch.clamp(video.float(), -1., 1.)
+        n = video.shape[0]
+        for i in range(n):
+            grid = video[i,...]
+            grid = (grid + 1.0) / 2.0
+            grid = (grid * 255).to(torch.uint8).permute(1, 2, 3, 0) #thwc
+            path = os.path.join(savedirs[idx].replace('samples', 'samples_separate'), f'{filename.split(".")[0]}_sample{i}.mp4')
+            torchvision.io.write_video(path, grid, fps=fps, video_codec='h264', options={'crf': '10'})
+    print("Saved!")
 
 class DiffusionModule(nn.Module):
     def __init__(self, parser, config_dir, save_dir, prompt_dir, epochs=500, save_every_n_epoch=100, device="cuda"):
@@ -105,14 +130,13 @@ class DiffusionModule(nn.Module):
         os.makedirs(self.save_dir, exist_ok=True)
 
         assert os.path.exists(self.prompt_dir)
-        data_list, prompt_list, pointcloud_list, data_all_list, fn = self.load_data_prompts(self.prompt_dir,
+        filename_list, data_list, prompt_list, pointcloud_list, data_all_list, fn = self.load_data_prompts(self.prompt_dir,
                                                                             video_size=(
                                                                             height, width),
                                                                             video_frames=n_frames,
                                                                             interp=True)
         prompts = prompt_list[0]
-        # images = data_list[0]
-        images = data_all_list[0]
+        images = data_list[0]
         pointcloud = pointcloud_list[0]
         images_all = data_all_list[0]
 
@@ -123,24 +147,23 @@ class DiffusionModule(nn.Module):
             videos_all = images_all.unsqueeze(0).to("cuda") #[1,3,16,512,512]
         fs = torch.tensor([fs], dtype=torch.long, device=self.device)
 
-        mid_idx = videos_all.shape[2] // 2  # 中间帧索引
-        img_first = videos_all[:, :, 0]  # 首帧
-        img_mid = videos_all[:, :, mid_idx]  # 中间帧
-        img_last = videos_all[:, :, -1] 
+        # mid_idx = videos_all.shape[2] // 2  # 中间帧索引
+        # img_first = videos_all[:, :, 0]  # 首帧
+        # img_mid = videos_all[:, :, mid_idx]  # 中间帧
+        # img_last = videos_all[:, :, -1] 
         
-        img_emb_first = self.model.embedder(img_first)  # [B, L, C]
-        img_emb_mid = self.model.embedder(img_mid)
-        img_emb_last = self.model.embedder(img_last)
+        # img_emb_first = self.model.embedder(img_first)  # [B, L, C]
+        # img_emb_mid = self.model.embedder(img_mid)
+        # img_emb_last = self.model.embedder(img_last)
 
-        img_emb_first = self.model.image_proj_model(img_emb_first)
-        img_emb_mid = self.model.image_proj_model(img_emb_mid)
-        img_emb_last = self.model.image_proj_model(img_emb_last)
-        img_emb = torch.cat([img_emb_first, img_emb_mid, img_emb_last], dim=1)  # [B, 3L, C]
+        # img_emb_first = self.model.image_proj_model(img_emb_first)
+        # img_emb_mid = self.model.image_proj_model(img_emb_mid)
+        # img_emb_last = self.model.image_proj_model(img_emb_last)
+        # img_emb = torch.cat([img_emb_first, img_emb_mid, img_emb_last], dim=1)  # [B, 3L, C]
         
-        # img = videos[:, :, 0]  # bchw  [1,3,512,512]
-        # img_emb = self.model.embedder(img)  ## blc
-        # img_emb = self.model.image_proj_model(img_emb)
-        # img_emb = torch.cat([img_emb_first, img_emb_last], dim=1) 
+        img = videos[:, :, 0]  # bchw  [1,3,512,512]
+        img_emb = self.model.embedder(img)  ## blc
+        img_emb = self.model.image_proj_model(img_emb)
 
         pc_emb = self.model.pc_embedder(pointcloud)
         
@@ -149,6 +172,8 @@ class DiffusionModule(nn.Module):
         # cond = {"c_crossattn": [torch.cat([cond_emb, img_emb], dim=1)]}
         
         # masks = self.generate_mask(images_all)
+        # with torch.no_grad():
+        #     masks_z = get_latent_z(self.model, masks)
 
         if self.model.model.conditioning_key == 'hybrid':
             z = get_latent_z(self.model, videos)  # b c t h w
@@ -164,116 +189,13 @@ class DiffusionModule(nn.Module):
             img_cat_cond[:, :, -1, :, :] = z[:, :, -1, :, :]
             cond["c_concat"] = [img_cat_cond]  # b c 1 h w [1, 4, 16, 64, 64]
 
+        # z = z * (1 - masks_z)
         out = [z, cond]
 
         if return_fs:
             out.append(fs)
 
         return out
-
-    # new_poses return (16, 7) 固定椭圆 没有限制在一个椭圆轨道之内
-    def get_new_pose(self, original_pose, num_views=14):
-        """
-        根据两个初始相机的位姿生成一个椭圆轨道，并在轨道上生成新的视角和位姿，且仅在两个初始位姿之间。
-
-        参数:
-            original_pose (torch.Tensor 或 np.ndarray): 包含两个相机位姿的张量 (1, 2, 7)。
-            num_views (int): 需要生成的新视角数量，默认为14。
-
-        返回:
-            torch.Tensor: 包含每个新视角的位姿 (R_new, t_new) 的张量，形状为 (num_views, 7)。
-        """
-        # 确保 original_pose 是 NumPy 数组
-        if isinstance(original_pose, np.ndarray):
-            pose_array = original_pose
-        else:
-            pose_array = original_pose.detach().cpu().numpy()  # 确保是 NumPy 数据
-
-        # 提取第一相机的四元数和平移向量
-        q1 = pose_array[0, 0, :4]  # (4,) 四元数
-        t1 = pose_array[0, 0, 4:7].reshape(3, 1)  # (3,1) 平移向量
-
-        # 提取第二相机的四元数和平移向量
-        q2 = pose_array[0, 1, :4]  # (4,)
-        t2 = pose_array[0, 1, 4:7].reshape(3, 1)  # (3,1)
-
-        # 将四元数转换为旋转矩阵 (确保四元数格式为 [x, y, z, w])
-        R1 = R.from_quat(q1).as_matrix()  # (3,3)
-        R2 = R.from_quat(q2).as_matrix()  # (3,3)
-
-        # 计算相机中心
-        C1 = -R1.T @ t1  # (3,1)
-        C2 = -R2.T @ t2  # (3,1)
-
-        # 椭圆参数
-        center = (C1 + C2) / 2  # 椭圆中心 (3,1)
-        a = np.linalg.norm(C1 - C2) / 2  # 长轴
-        b = a / 2  # 短轴
-
-        # 计算两个相机视角之间的角度范围
-        angle1 = np.arctan2(C1[1] - center[1], C1[0] - center[0])  # 视角1的角度
-        angle2 = np.arctan2(C2[1] - center[1], C2[0] - center[0])  # 视角2的角度
-
-        # 确保角度按顺时针或逆时针顺序排列
-        if angle2 < angle1:
-            angle2 += 2 * np.pi  # 保证 angle2 大于 angle1
-
-        # 在两个视角之间均匀分布的角度
-        angles = np.linspace(angle1, angle2, num_views)  # 均匀采样角度
-
-        # 生成椭圆轨道上的点
-        ellipse_points = np.hstack([a * np.cos(angles).reshape(-1, 1),
-                                    b * np.sin(angles).reshape(-1, 1),
-                                    np.zeros((num_views, 1))])  # (num_views, 3)
-
-        # 处理广播问题 (转换 center 为 (1,3) 以进行广播)
-        center = center.reshape(1, 3)  # 确保形状匹配
-        ellipse_points = ellipse_points + center  # (num_views, 3) + (1, 3) 可广播
-
-        # 计算每个点的位姿
-        poses = []
-        for point in ellipse_points:
-            # 相机位置
-            C_new = point.reshape(3, 1)  # 转换为 (3,1)
-
-            # 相机朝向场景中心
-            look_at = center.T  # 变成 (3,1)
-            forward = look_at - C_new
-            forward = forward / np.linalg.norm(forward)
-
-            # 计算旋转矩阵
-            up = np.array([0, 1, 0])  # 假设上方向为 Y 轴
-            right = np.cross(up, forward.squeeze())  # 计算右方向
-            right = right / np.linalg.norm(right)
-            up = np.cross(forward.squeeze(), right)  # 重新计算 up
-
-            R_new = np.vstack((right, up, -forward.squeeze())).T  # 计算新的旋转矩阵
-            # 强制保证旋转矩阵是右手坐标系
-            if np.linalg.det(R_new) < 0:
-                R_new = -R_new
-
-            # 计算新的平移向量
-            t_new = -R_new @ C_new
-
-            # 将旋转矩阵转换为四元数
-            q_new = R.from_matrix(R_new).as_quat()  # (4,)
-
-            # 将四元数和平移向量合并为一个 7 维向量
-            pose_new = np.concatenate([q_new, t_new.squeeze()])  # (7,)
-
-            # 添加新位姿到 poses 列表中
-            poses.append(pose_new)
-
-        # 将第一个和最后一个视角添加为原始位姿
-        q1_t = np.concatenate([q1, t1.squeeze()])  # (7,)
-        q2_t = np.concatenate([q2, t2.squeeze()])  # (7,)
-
-        poses.insert(0, q1_t)  # 在最前面添加原始第一个相机位姿
-        poses.append(q2_t)  # 在最后添加原始第二个相机位姿
-
-        poses_np = np.array(poses, dtype=np.float32)  
-        poses_tensor = torch.from_numpy(poses_np)
-        return poses_tensor.unsqueeze(0).to(self.device)
 
     def generate_mask(self, image, threshold=0.1):
         mean_image = image.mean(dim=(0, 2, 3), keepdim=True)  # [c, 1, 1, 1]
@@ -304,6 +226,7 @@ class DiffusionModule(nn.Module):
         file_list = self.get_filelist(data_dir, ['jpg', 'png', 'jpeg', 'JPEG', 'PNG', 'JPG'])
         # assert len(file_list) == n_samples, "Error: data and prompts are NOT paired!"
         data_list = []
+        filename_list = []
         data_all_list = []
         pointcloud_list = []
         prompt_list = self.load_prompts(prompt_file[default_idx])
@@ -334,15 +257,18 @@ class DiffusionModule(nn.Module):
                 frame_tensor1 = repeat(image_tensor1, 'c t h w -> c (repeat t) h w', repeat=video_frames // 2)
                 frame_tensor2 = repeat(image_tensor2, 'c t h w -> c (repeat t) h w', repeat=video_frames // 2)
                 frame_tensor = torch.cat([frame_tensor1, frame_tensor2], dim=1)
+                _, filename = os.path.split(file_list[idx*2])
             else:
                 image = Image.open(file_list[idx]).convert('RGB')
                 image_tensor = transform(image).unsqueeze(1)  # [c,1,h,w]
                 frame_tensor = repeat(image_tensor, 'c t h w -> c (repeat t) h w', repeat=video_frames)
+                _, filename = os.path.split(file_list[idx])
 
             data_list.append(frame_tensor)
         pointcloud_tensor = self.load_pointcloud(os.path.join(data_dir, "points3D.ply"))
         pointcloud_list.append(pointcloud_tensor)
-        return data_list, prompt_list, pointcloud_list, data_all_list, fn
+        filename_list.append(filename)
+        return filename_list, data_list, prompt_list, pointcloud_list, data_all_list, fn
 
     def load_pointcloud(self, ply_file, sample_ratio=1 / 8):
         plydata = PlyData.read(ply_file)
@@ -439,6 +365,90 @@ class DiffusionModule(nn.Module):
 
         # torch.save(self.model.state_dict(), os.path.join(save_dir, "last.ckpt"))
         print("Done!")
+        
+    def inference(self, save_path, height=512, width=512, fs=3, n_frames=16, ddim_steps=50, ddim_eta=1., **kwargs):
+        self.model.eval()
+        h, w = height // 8, width // 8
+        filename_list, data_list, prompt_list, pointcloud_list, data_all_list, _ = self.load_data_prompts(self.prompt_dir,
+                                                                            video_size=(
+                                                                            height, width),
+                                                                            video_frames=n_frames,
+                                                                            interp=True)
+        prompts = prompt_list[0]
+        images = data_list[0]
+        # images = data_all_list[0]
+        pointcloud = pointcloud_list[0]
+        images_all = data_all_list[0]
+        
+        channels = self.model.model.diffusion_model.out_channels
+        noise_shape = [1, channels, n_frames, h, w]
+        batch_size = noise_shape[0]
+       
+        
+        with torch.no_grad(), torch.amp.autocast('cuda'):
+            if isinstance(images, list):
+                videos = torch.stack(images, dim=0).to("cuda")
+            else:
+                videos = images.unsqueeze(0).to("cuda") #[1,3,16,512,512]
+                videos_all = images_all.unsqueeze(0).to("cuda") #[1,3,16,512,512]
+            
+            fs = torch.tensor([fs] * batch_size, dtype=torch.long, device=self.model.device)
+            ddim_sampler = DDIMSampler(self.model)
+            
+            img = videos[:,:,0] # bchw
+            img_emb = self.model.embedder(img) ## blc
+            img_emb = self.model.image_proj_model(img_emb)
+            
+            cond_emb = self.model.get_learned_conditioning(prompts)
+            cond = {"c_crossattn": [torch.cat([cond_emb, img_emb], dim=1)]}
+            
+            z = get_latent_z(self.model, videos)
+            img_cat_cond = torch.zeros_like(z)
+            img_cat_cond[:,:,0,:,:] = z[:,:,0,:,:]
+            img_cat_cond[:,:,-1,:,:] = z[:,:,-1,:,:]
+            cond["c_concat"] = [img_cat_cond]
+
+            cond_z0 = None
+            cond_mask = None
+            kwargs.update({"unconditional_conditioning_img_nonetext": None})
+
+            batch_variants = []
+            samples, _ = ddim_sampler.sample(S=ddim_steps,
+                                            conditioning=cond,
+                                            batch_size=batch_size,
+                                            shape=noise_shape[1:],
+                                            verbose=False,
+                                            unconditional_guidance_scale=1.0,
+                                            unconditional_conditioning=None,
+                                            eta=ddim_eta,
+                                            cfg_img=None, 
+                                            mask=cond_mask,
+                                            x0=cond_z0,
+                                            fs=fs,
+                                            timestep_spacing="uniform",
+                                            guidance_rescale=0.0,
+                                            **kwargs
+                                            )
+            
+            batch_images = self.model.decode_first_stage(samples)
+            batch_variants.append(batch_images)
+            batch_variants = torch.stack(batch_variants)
+            batch_samples = batch_variants.permute(1, 0, 2, 3, 4, 5)
+            for nn, samples in enumerate(batch_samples):
+                prompt = prompt_list[nn]
+                filename = filename_list[nn]
+                save_results_seperate(prompt, samples, filename, save_path, fps=8, loop=False)
+
+        
+    def decode_and_save_video(self, save_path="final_video.mp4", fps=8):
+        z, _, _ = self.get_batch_input(return_fs=True)
+        video = self.model.decode_first_stage(z).detach().cpu()
+        video = torch.clamp(video, -1., 1.)
+        video = (video + 1) / 2
+        video = (video * 255).to(torch.uint8)  # [1, 3, T, H, W]
+        video = video[0].permute(1, 2, 3, 0)  # [T, H, W, C]
+        torchvision.io.write_video(save_path, video, fps=fps, video_codec='h264', options={"crf": "10"})
+        print(f"Saved video to: {save_path}")
 
 
 if __name__ == '__main__':
@@ -469,5 +479,6 @@ if __name__ == '__main__':
 
     args = parser.parse_args()
 
-    diffusionModule = DiffusionModule(parser, [config_file], save_dir, args.data_dir, epochs=20, save_every_n_epoch=10)
+    diffusionModule = DiffusionModule(parser, [config_file], save_dir, args.data_dir, epochs=10, save_every_n_epoch=10)
     diffusionModule.train()
+    diffusionModule.inference("results")
